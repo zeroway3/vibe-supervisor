@@ -34,11 +34,17 @@ export function generateReport(
   const { total, confirmed, estimated, unknown } = confidenceBreakdown(ledgerEntries);
   const unapproved = input.findings.filter((f) => f.status === "open");
 
-  return `# 바이브 슈퍼바이저 — 개발보안 감독 리포트 (샘플)
-
-> ⚠ 이 리포트는 **데모용 샘플 데이터**로 생성되었습니다. 실제 고객 저장소의
+  const warningBlock = input.isSample
+    ? `> ⚠ 이 리포트는 **데모용 샘플 데이터**로 생성되었습니다. 실제 고객 저장소의
 > 실데이터가 아니며, ISMS-P 조항 매핑도 재검증이 필요한 추정값입니다.
-> 심사 자료로서의 수용 가능성을 확인하기 위한 형식 검토용 샘플입니다.
+> 심사 자료로서의 수용 가능성을 확인하기 위한 형식 검토용 샘플입니다.`
+    : `> ⚠ 이 리포트는 이 저장소의 **실제 원장·스캔 기록**으로 생성되었습니다.
+> 다만 ISMS-P 조항 매핑은 아직 현직 심사원 검증을 거치지 않은 추정값입니다 —
+> 리포트 본문의 "[확인 필요]" 표기가 붙은 항목은 심사 근거로 그대로 인용하지 마세요.`;
+
+  return `# 바이브 슈퍼바이저 — 개발보안 감독 리포트${input.isSample ? " (샘플)" : ""}
+
+${warningBlock}
 
 | 항목 | 값 |
 |---|---|

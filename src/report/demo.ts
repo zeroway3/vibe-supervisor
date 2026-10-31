@@ -84,6 +84,7 @@ const report = generateReport(
     periodEnd: "2026-09-30",
     ruleset: { version: "ko-regulatory-v1.2", hash: rulesetHash },
     findings,
+    isSample: true,
   },
   entries,
   integrity

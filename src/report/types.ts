@@ -28,4 +28,8 @@ export interface ReportInput {
   periodEnd: string;
   ruleset: RulesetInfo;
   findings: Finding[];
+  /** true면 가짜 데모 데이터(심사원 인터뷰용), false면 실제 저장소에서 scan/approve로
+   * 쌓인 실데이터. 리포트 상단 경고 문구가 이 값에 따라 달라진다 — 실데이터를
+   * "샘플"이라고 잘못 표기하면 증빙으로서의 신뢰도 자체가 깨지므로 반드시 구분한다. */
+  isSample: boolean;
 }

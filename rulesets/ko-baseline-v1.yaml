@@ -1,0 +1,69 @@
+# 재현 가능한 감사 리포트를 위한 고정 룰셋. semgrep --config auto는 클라우드
+# 레지스트리를 매번 새로 긁어와서 "6개월 뒤 같은 결과"를 보장할 수 없다 —
+# 이 파일 내용이 바뀌지 않는 한 스캔 결과는 항상 같아야 한다(파일 해시가
+# 리포트의 ruleset.hash로 그대로 박힌다).
+#
+# 범위는 의도적으로 좁다 — 탐지 정확도로 경쟁하지 않는다는 제품 설계상,
+# 여기 룰은 "흔하고 명백한" 개발보안 이슈만 다루고, 본격 SAST는 Semgrep
+# Registry(auto)나 상용 도구에 맡긴다(그 결과도 SARIF로 받아들이는 게
+# 설계 목표). 지원서가 1순위로 둔 Java/Spring 위주로 작성했다.
+rules:
+  - id: ko-baseline.hardcoded-secret
+    languages: [java, javascript, typescript, python]
+    severity: ERROR
+    message: >-
+      비밀값(API 키·비밀번호·토큰)으로 보이는 문자열이 소스코드에 직접
+      하드코딩되어 있습니다. 환경변수나 비밀 관리 서비스로 옮기세요.
+    metadata:
+      category: security
+      owasp: "A02:2021 - Cryptographic Failures"
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+    patterns:
+      - pattern: $X = "..."
+      - metavariable-regex:
+          metavariable: $X
+          regex: (?i)(password|passwd|pwd|secret|api_?key|apikey|access_?token|private_?key)
+
+  - id: ko-baseline.sql-string-concat
+    languages: [java]
+    severity: ERROR
+    message: >-
+      문자열 결합으로 SQL 쿼리를 만들고 있습니다. SQL 인젝션 위험이 있으니
+      PreparedStatement/바인드 파라미터를 사용하세요.
+    metadata:
+      category: security
+      owasp: "A03:2021 - Injection"
+      cwe: "CWE-89: SQL Injection"
+    patterns:
+      - pattern-either:
+          - pattern: $STMT.executeQuery("..." + $X + "...")
+          - pattern: $STMT.execute("..." + $X + "...")
+          - pattern: $STMT.executeUpdate("..." + $X + "...")
+
+  - id: ko-baseline.eval-exec-usage
+    languages: [javascript, typescript, python]
+    severity: WARNING
+    message: >-
+      eval/exec류 동적 실행 함수를 사용하고 있습니다. 외부 입력이 섞여
+      들어갈 수 있다면 코드 인젝션 위험이 있습니다.
+    metadata:
+      category: security
+      owasp: "A03:2021 - Injection"
+      cwe: "CWE-95: Eval Injection"
+    patterns:
+      - pattern-either:
+          - pattern: eval(...)
+          - pattern: exec(...)
+
+  - id: ko-baseline.weak-random-for-security
+    languages: [java]
+    severity: WARNING
+    message: >-
+      java.util.Random은 암호학적으로 안전하지 않습니다. 토큰·세션ID
+      생성에는 SecureRandom을 사용하세요.
+    metadata:
+      category: security
+      owasp: "A02:2021 - Cryptographic Failures"
+      cwe: "CWE-330: Use of Insufficiently Random Values"
+    patterns:
+      - pattern: new Random(...)
