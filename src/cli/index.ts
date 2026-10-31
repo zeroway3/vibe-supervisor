@@ -9,6 +9,8 @@ import { Ledger } from "../ledger/db.js";
 import { FindingsStore } from "../findings/store.js";
 import { runSemgrepScan } from "../scan/semgrep.js";
 import { generateReport } from "../report/generate.js";
+import { AnchorStore } from "../timestamp/store.js";
+import { requestTimestamp, KNOWN_TSA_URLS } from "../timestamp/rfc3161.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const HOOK_SCRIPT = join(__dirname, "..", "hooks", "post-commit.js");
@@ -51,7 +53,7 @@ program
 
 program
   .command("verify")
-  .description("감독 원장의 해시 체인 무결성을 검증한다")
+  .description("감독 원장의 해시 체인 무결성 + 외부 타임스탬프 앵커를 검증한다")
   .action(() => {
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
     const dbPath = join(repoRoot, ".vibe-supervisor", "ledger.db");
@@ -61,12 +63,95 @@ program
     }
     const ledger = new Ledger(dbPath);
     const result = ledger.verify();
+    const entries = ledger.all();
     ledger.close();
 
     if (result.ok) {
       console.log("체인 무결성 OK — 변조 흔적 없음.");
     } else {
       console.error(`체인 깨짐 — id=${result.brokenAtId} 이후 기록이 원래 해시와 안 맞습니다.`);
+      process.exit(1);
+    }
+
+    // 앵커 검증: "지금 체인을 통째로 새로 만든 게 아니라, 외부 TSA가 과거에
+    // 도장 찍어준 그 시점까지는 진짜로 그대로 이어져 왔다"를 확인한다.
+    // 체인 해시 자체가 OK여도, 전체를 처음부터 다시 만들면 내부적으로는
+    // 일관된 새 체인이 되므로(이게 Q4-2에서 스스로 짚은 구멍) — 앵커가 그
+    // "다시 만들었는지"를 외부 기준으로 잡아낸다.
+    const anchorDbPath = join(repoRoot, ".vibe-supervisor", "anchors.db");
+    if (existsSync(anchorDbPath)) {
+      const anchorStore = new AnchorStore(anchorDbPath);
+      const anchors = anchorStore.all();
+      anchorStore.close();
+
+      let anchorsOk = true;
+      for (const a of anchors) {
+        const entry = entries.find((e) => e.id === a.ledgerEntryId);
+        if (!entry || entry.hash !== a.anchoredHash) {
+          console.error(
+            `앵커 #${a.id} 불일치 — 원장 #${a.ledgerEntryId}의 현재 해시가 ` +
+              `${a.tsaUrl}가 ${a.genTime}에 서명한 해시(${a.anchoredHash.slice(0, 16)}…)와 다릅니다. ` +
+              `이 시점 이전 기록이 나중에 통째로 다시 생성됐을 가능성이 있습니다.`
+          );
+          anchorsOk = false;
+        }
+      }
+      if (anchorsOk && anchors.length > 0) {
+        const latest = anchors[anchors.length - 1];
+        console.log(
+          `외부 타임스탬프 앵커 ${anchors.length}건 전부 일치 — ` +
+            `가장 최근 앵커(${latest.genTime}, ${latest.tsaUrl}) 시점까지는 소급 재생성되지 않았음을 확인.`
+        );
+      }
+      if (!anchorsOk) process.exit(1);
+    } else {
+      console.log("(참고) 외부 타임스탬프 앵커가 아직 없습니다 — 'vibe-supervisor anchor'로 추가할 수 있습니다.");
+    }
+  });
+
+program
+  .command("anchor")
+  .description("원장 체인의 현재 끝 해시를 외부 RFC3161 타임스탬프 기관(TSA)에 등록한다 — 소급 재생성 방지용")
+  .option("--tsa <url>", "TSA 엔드포인트 URL", KNOWN_TSA_URLS.freetsa)
+  .action(async (opts) => {
+    const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
+    const ledgerPath = join(vsDir(repoRoot), "ledger.db");
+    if (!existsSync(ledgerPath)) {
+      console.error("원장이 아직 없습니다 — 커밋을 먼저 해보세요.");
+      process.exit(1);
+    }
+
+    const ledger = new Ledger(ledgerPath);
+    const entries = ledger.all();
+    ledger.close();
+
+    if (entries.length === 0) {
+      console.error("원장에 기록이 없습니다.");
+      process.exit(1);
+    }
+    const tip = entries[entries.length - 1];
+
+    console.log(`[vibe-supervisor] ${opts.tsa}에 원장 #${tip.id}(hash=${tip.hash.slice(0, 16)}…) 타임스탬프 요청 중...`);
+    try {
+      const result = await requestTimestamp(Buffer.from(tip.hash, "utf-8"), opts.tsa);
+
+      const anchorStore = new AnchorStore(join(vsDir(repoRoot), "anchors.db"));
+      const anchor = anchorStore.save({
+        ledgerEntryId: tip.id,
+        anchoredHash: tip.hash,
+        tsaUrl: opts.tsa,
+        genTime: result.genTime,
+        serialNumber: result.serialNumberHex,
+        tokenDer: result.tokenDer,
+      });
+      anchorStore.close();
+
+      console.log(
+        `[vibe-supervisor] 앵커 #${anchor.id} 저장 완료 — TSA가 ${result.genTime}에 서명 ` +
+          `(serial=${result.serialNumberHex}). 'verify'로 언제든 재확인 가능.`
+      );
+    } catch (err: any) {
+      console.error(`타임스탬프 요청 실패: ${err.message}`);
       process.exit(1);
     }
   });
@@ -227,6 +312,21 @@ program
       ? createHash("sha256").update(readFileSync(RULESET_PATH)).digest("hex")
       : "unknown";
 
+    const anchorDbPath = join(vsDir(repoRoot), "anchors.db");
+    const anchorStatus = (() => {
+      if (!existsSync(anchorDbPath)) return undefined;
+      const anchorStore = new AnchorStore(anchorDbPath);
+      const anchors = anchorStore.all();
+      anchorStore.close();
+      if (anchors.length === 0) return undefined;
+      const allMatch = anchors.every((a) => {
+        const entry = entries.find((e) => e.id === a.ledgerEntryId);
+        return entry?.hash === a.anchoredHash;
+      });
+      const latest = anchors[anchors.length - 1];
+      return { count: anchors.length, latestGenTime: latest.genTime, latestTsaUrl: latest.tsaUrl, allMatch };
+    })();
+
     const report = generateReport(
       {
         repoName,
@@ -237,7 +337,8 @@ program
         isSample: false,
       },
       entries,
-      integrity
+      integrity,
+      anchorStatus
     );
 
     writeFileSync(opts.output, report);

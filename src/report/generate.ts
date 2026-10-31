@@ -1,6 +1,13 @@
 import type { LedgerEntry } from "../ledger/types.js";
 import type { ReportInput, Finding } from "./types.js";
 
+export interface AnchorStatus {
+  count: number;
+  latestGenTime: string | null;
+  latestTsaUrl: string | null;
+  allMatch: boolean;
+}
+
 function pct(n: number, total: number): string {
   if (total === 0) return "0%";
   return `${((n / total) * 100).toFixed(1)}%`;
@@ -29,7 +36,8 @@ function findingsTable(findings: Finding[]): string {
 export function generateReport(
   input: ReportInput,
   ledgerEntries: LedgerEntry[],
-  chainIntegrity: { ok: boolean; brokenAtId: number | null }
+  chainIntegrity: { ok: boolean; brokenAtId: number | null },
+  anchorStatus: AnchorStatus = { count: 0, latestGenTime: null, latestTsaUrl: null, allMatch: true }
 ): string {
   const { total, confirmed, estimated, unknown } = confidenceBreakdown(ledgerEntries);
   const unapproved = input.findings.filter((f) => f.status === "open");
@@ -53,6 +61,7 @@ ${warningBlock}
 | 룰셋 버전 | ${input.ruleset.version} (hash: \`${input.ruleset.hash.slice(0, 16)}…\`) |
 | 생성 시각 | ${new Date().toISOString()} |
 | 원장 무결성 | ${chainIntegrity.ok ? "✅ 정상 (변조 흔적 없음)" : `❌ 깨짐 — id=${chainIntegrity.brokenAtId} 이후`} |
+| 외부 타임스탬프 앵커 | ${anchorStatus.count === 0 ? "⚠ 없음 — 소급 재생성 여부를 외부적으로 증명할 수 없음" : anchorStatus.allMatch ? `✅ ${anchorStatus.count}건, 최근 ${anchorStatus.latestGenTime}(${anchorStatus.latestTsaUrl})` : "❌ 불일치 — 소급 재생성 의심"} |
 
 ## 1. 출처 추적 요약
 
@@ -80,7 +89,22 @@ ${findingsTable(input.findings)}
 생성해도 동일한 결과가 나옵니다 — 생성 시점에 따라 결과가 달라지는 LLM 단독
 도구와의 핵심 차이점입니다.
 
-## 4. 감독 원장 상세 (부록)
+## 4. 소급 재생성 방지 (외부 타임스탬프 앵커)
+
+해시 체인은 변조는 막지만, 원장 전체를 처음부터 다시 만들면 내부적으로는
+일관된 새 체인이 만들어집니다. 이를 막기 위해 독립적인 외부 기관(RFC3161
+타임스탬프 기관)에 주기적으로 원장 끝 해시를 등록합니다 — 그 기관이 서명한
+시각 이전 기록은, 지금 원장의 해당 지점 해시가 그 서명된 해시와 여전히
+같아야만 "그 이후로 다시 만들어지지 않았다"고 증명됩니다.
+
+${
+  anchorStatus.count === 0
+    ? "아직 등록된 앵커가 없습니다."
+    : `등록된 앵커: ${anchorStatus.count}건. 가장 최근 앵커 — ${anchorStatus.latestGenTime} (${anchorStatus.latestTsaUrl})가 서명.
+검증 결과: ${anchorStatus.allMatch ? "전부 일치 — 각 앵커 시점까지는 소급 재생성되지 않았음을 확인." : "불일치 발견 — 일부 구간이 사후에 다시 생성됐을 가능성이 있습니다. 즉시 조사가 필요합니다."}`
+}
+
+## 5. 감독 원장 상세 (부록)
 
 | # | 커밋 | 시각 | 출처 | 파일 수 | 레코드 해시 |
 |---|---|---|---|---|---|

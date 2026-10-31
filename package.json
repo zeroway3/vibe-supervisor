@@ -13,8 +13,10 @@
     "postcommit": "tsx src/hooks/post-commit.ts"
   },
   "dependencies": {
+    "asn1js": "^3.1.0",
     "better-sqlite3": "^11.3.0",
-    "commander": "^12.1.0"
+    "commander": "^12.1.0",
+    "pkijs": "^3.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
