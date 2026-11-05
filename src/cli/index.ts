@@ -271,6 +271,7 @@ program
     }
 
     let targetFiles: string[] | undefined;
+    let recordFiles: string[] | undefined;
     if (!opts.all) {
       targetFiles = git(
         ["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "--diff-filter=d", commitHash],
@@ -282,11 +283,19 @@ program
         console.log("변경된 파일이 없습니다 — --all로 전체 검사를 하려면 옵션을 추가하세요.");
         return;
       }
+    } else {
+      // 실제 스캔은 그대로 semgrep의 gitignore-aware 전체 순회(".")에 맡기되
+      // (targetFiles는 undefined로 둔다), "무엇을 봤는지"는 git이 보는 파일
+      // 목록으로 따로 기록한다 — 이게 없으면 전체 검사는 나중에 재검사 근거로
+      // 못 쓰인다(ledger/rescan.ts 참고).
+      recordFiles = git(["ls-files", "--cached", "--others", "--exclude-standard"], repoRoot)
+        .split("\n")
+        .filter(Boolean);
     }
 
     console.log(`[vibe-supervisor] semgrep 스캔 중... (${targetFiles ? `${targetFiles.length}개 파일, 증분` : "저장소 전체"})`);
     const actor = git(["config", "user.email"], repoRoot) || "unknown";
-    const { findings, ruleset } = scanAndRecord(repoRoot, RULESET_PATH, commitHash, actor, targetFiles);
+    const { findings, ruleset } = scanAndRecord(repoRoot, RULESET_PATH, commitHash, actor, targetFiles, recordFiles);
 
     console.log(
       `[vibe-supervisor] 스캔 완료 — 발견 ${findings.length}건 ` +
