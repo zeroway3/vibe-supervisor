@@ -8,7 +8,10 @@ import { parseAiTrailer } from "../trailer/parse.js";
 import { isSemgrepAvailable, scanAndRecord } from "../scan/run.js";
 import { FindingsStore } from "../findings/store.js";
 import { rescanEvidence } from "../ledger/rescan.js";
-import type { FileHash } from "../ledger/types.js";
+import type { FileHash, LedgerEntry } from "../ledger/types.js";
+import { loadConfig } from "../config/store.js";
+import { AnchorStore } from "../timestamp/store.js";
+import { requestTimestamp } from "../timestamp/rfc3161.js";
 
 /** 이번 검사에서 더는 나오지 않은 기존 미승인 항목을 알려준다. 상태는 자동으로 바꾸지
  * 않는다 — "고쳤다"는 판단은 사람이 --fixed로 기록해야 원장의 의미가 산다. */
@@ -36,7 +39,72 @@ function git(args: string[], cwd: string): string {
   return execFileSync("git", args, { cwd, encoding: "utf-8" }).trim();
 }
 
-function main() {
+/** 조건(커밋 N건 또는 N시간 경과)이 차면 자동으로 앵커링한다. 네트워크가
+ * 느리거나 끊겨 있어도 커밋 자체를 막으면 안 되므로 타임아웃을 걸고,
+ * 실패하면 경고만 찍고 조용히 넘어간다 — 조건은 그대로 남아 다음 커밋에서
+ * 다시 시도된다. */
+async function maybeAutoAnchor(repoRoot: string, allEntries: LedgerEntry[]) {
+  const vsDir = join(repoRoot, ".vibe-supervisor");
+  const config = loadConfig(join(vsDir, "config.json"));
+  if (!config.autoAnchor.enabled || allEntries.length === 0) return;
+
+  const anchorStore = new AnchorStore(join(vsDir, "anchors.db"));
+  const anchors = anchorStore.all();
+  const latest = anchors[anchors.length - 1];
+
+  const commitsSinceAnchor = latest
+    ? allEntries.filter((e) => e.id > latest.ledgerEntryId).length
+    : allEntries.length;
+  // 앵커가 한 번도 없었다면 기준 시각이 없다 — latest.anchoredAt 대신 원장의
+  // 첫 기록 시각을 기준으로 삼는다. (여기서 Infinity를 쓰면 maxAgeHours 조건이
+  // 앵커가 없는 동안 항상 참이 되어 everyNCommits 설정과 무관하게 첫 커밋부터
+  // 바로 앵커링되는 버그가 생긴다 — 실제로 재현해서 확인함.)
+  const referenceTime = latest ? latest.anchoredAt : allEntries[0].timestamp;
+  const hoursSinceAnchor = (Date.now() - new Date(referenceTime).getTime()) / 3_600_000;
+
+  const due =
+    commitsSinceAnchor >= config.autoAnchor.everyNCommits ||
+    hoursSinceAnchor >= config.autoAnchor.maxAgeHours;
+
+  if (!due) {
+    anchorStore.close();
+    return;
+  }
+
+  const tip = allEntries[allEntries.length - 1];
+  console.log(
+    `[vibe-supervisor] 자동 앵커링 조건 충족(커밋 ${commitsSinceAnchor}건 경과) — ` +
+      `${config.autoAnchor.tsaUrl}에 요청 중...`
+  );
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.autoAnchor.timeoutMs);
+  try {
+    const result = await requestTimestamp(
+      Buffer.from(tip.hash, "utf-8"),
+      config.autoAnchor.tsaUrl,
+      controller.signal
+    );
+    const saved = anchorStore.save({
+      ledgerEntryId: tip.id,
+      anchoredHash: tip.hash,
+      tsaUrl: config.autoAnchor.tsaUrl,
+      genTime: result.genTime,
+      serialNumber: result.serialNumberHex,
+      tokenDer: result.tokenDer,
+    });
+    console.log(`[vibe-supervisor] 자동 앵커 #${saved.id} 저장 완료 (${result.genTime})`);
+  } catch (err: any) {
+    console.warn(
+      `[vibe-supervisor] 자동 앵커링 실패 — 다음 커밋에서 재시도합니다: ${err.message}`
+    );
+  } finally {
+    clearTimeout(timer);
+    anchorStore.close();
+  }
+}
+
+async function main() {
   const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
   const commitHash = git(["rev-parse", "HEAD"], repoRoot);
   const commitMessage = git(["log", "-1", "--pretty=%B", commitHash], repoRoot);
@@ -84,6 +152,7 @@ function main() {
     fileHashes,
     payload: { kind: "generated", aiRatio, originSource },
   });
+  const allEntries = ledger.all();
   ledger.close();
 
   console.log(
@@ -96,32 +165,40 @@ function main() {
   // semgrep이 없거나 VS_SKIP_SCAN=1이면 건너뛰고, 나중에 'scan'으로 돌릴 수 있다.
   // 삭제된 파일은 검사 대상에서 뺀다.
   const scanTargets = [...existingFiles];
-  if (process.env.VS_SKIP_SCAN === "1" || scanTargets.length === 0) return;
-  if (!isSemgrepAvailable()) {
-    console.log("[vibe-supervisor] semgrep이 없어 커밋 시점 검사는 건너뜁니다 — 설치 후 'vibe-supervisor scan'으로 검사할 수 있습니다.");
-    return;
-  }
-  try {
-    const { findings } = scanAndRecord(repoRoot, RULESET_PATH, commitHash, actor, scanTargets);
-    const open = findings.filter((f) => f.status === "open");
-    if (open.length === 0) {
-      console.log("[vibe-supervisor] 검사 완료 — 새 발견사항 없음.");
-      reportResolvedByThisScan(repoRoot, commitHash);
-      return;
+  if (process.env.VS_SKIP_SCAN !== "1" && scanTargets.length > 0) {
+    if (!isSemgrepAvailable()) {
+      console.log("[vibe-supervisor] semgrep이 없어 커밋 시점 검사는 건너뜁니다 — 설치 후 'vibe-supervisor scan'으로 검사할 수 있습니다.");
+    } else {
+      try {
+        const { findings } = scanAndRecord(repoRoot, RULESET_PATH, commitHash, actor, scanTargets);
+        const open = findings.filter((f) => f.status === "open");
+        if (open.length === 0) {
+          console.log("[vibe-supervisor] 검사 완료 — 새 발견사항 없음.");
+          reportResolvedByThisScan(repoRoot, commitHash);
+        } else {
+          console.log(
+            `[vibe-supervisor] 검사 완료 — 미승인 발견사항 ${open.length}건` +
+              `${confidence !== "unknown" ? ` (AI 생성 커밋: ${aiTool})` : ""}:`
+          );
+          for (const f of open) {
+            console.log(`  #${f.id} [${f.severity}] ${f.ruleId}  ${f.file}:${f.line}`);
+          }
+          console.log("  → 'vibe-supervisor approve <번호> [--fixed | --exception] --note \"내용\"'으로 처리하세요.");
+          reportResolvedByThisScan(repoRoot, commitHash);
+        }
+      } catch (err: any) {
+        // 훅에서 검사 실패로 커밋 흐름을 막지 않는다 — 기록은 이미 남았다.
+        console.error(`[vibe-supervisor] 커밋 시점 검사 실패 (기록은 남음): ${err.message}`);
+      }
     }
-    console.log(
-      `[vibe-supervisor] 검사 완료 — 미승인 발견사항 ${open.length}건` +
-        `${confidence !== "unknown" ? ` (AI 생성 커밋: ${aiTool})` : ""}:`
-    );
-    for (const f of open) {
-      console.log(`  #${f.id} [${f.severity}] ${f.ruleId}  ${f.file}:${f.line}`);
-    }
-    console.log("  → 'vibe-supervisor approve <번호> [--fixed | --exception] --note \"내용\"'으로 처리하세요.");
-    reportResolvedByThisScan(repoRoot, commitHash);
-  } catch (err: any) {
-    // 훅에서 검사 실패로 커밋 흐름을 막지 않는다 — 기록은 이미 남았다.
-    console.error(`[vibe-supervisor] 커밋 시점 검사 실패 (기록은 남음): ${err.message}`);
   }
+
+  // 검사와 별개 관심사 — 검사가 건너뛰어지거나 실패해도 자동 앵커링은 그대로 시도한다.
+  await maybeAutoAnchor(repoRoot, allEntries);
 }
 
-main();
+main().catch((err) => {
+  // 훅이 실패해도 커밋 자체는 이미 끝난 뒤이므로, 로그만 남기고 exit code는
+  // 0으로 유지한다(여기서 예외를 그대로 던지면 git이 경고를 출력함).
+  console.error(`[vibe-supervisor] post-commit 훅 오류: ${err.message}`);
+});

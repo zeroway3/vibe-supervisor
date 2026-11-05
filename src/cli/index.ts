@@ -14,6 +14,7 @@ import { AnchorStore } from "../timestamp/store.js";
 import { requestTimestamp, KNOWN_TSA_URLS } from "../timestamp/rfc3161.js";
 import { runAudit } from "../audit.js";
 import { DECISION_LABEL, type FindingDecision } from "../report/types.js";
+import { loadConfig, saveConfig } from "../config/store.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const HOOK_SCRIPT = join(__dirname, "..", "hooks", "post-commit.js");
@@ -181,6 +182,55 @@ program
     } catch (err: any) {
       console.error(`타임스탬프 요청 실패: ${err.message}`);
       process.exit(1);
+    }
+  });
+
+program
+  .command("config")
+  .description("자동 앵커링 설정을 보거나 바꾼다 (.vibe-supervisor/config.json)")
+  .option("--auto-anchor <on|off>", "커밋 시 조건 충족하면 자동으로 anchor를 실행할지")
+  .option("--every-n-commits <n>", "마지막 앵커 이후 이만큼 커밋이 쌓이면 자동 앵커링", Number)
+  .option("--max-age-hours <n>", "마지막 앵커 이후 이만큼 시간이 지나면 자동 앵커링", Number)
+  .option("--tsa <url>", "자동 앵커링에 쓸 TSA URL")
+  .action((opts) => {
+    const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
+    const configPath = join(vsDir(repoRoot), "config.json");
+    const config = loadConfig(configPath);
+
+    let changed = false;
+    if (opts.autoAnchor !== undefined) {
+      if (opts.autoAnchor !== "on" && opts.autoAnchor !== "off") {
+        console.error("--auto-anchor는 on 또는 off만 됩니다.");
+        process.exit(1);
+      }
+      config.autoAnchor.enabled = opts.autoAnchor === "on";
+      changed = true;
+    }
+    if (opts.everyNCommits !== undefined) {
+      config.autoAnchor.everyNCommits = opts.everyNCommits;
+      changed = true;
+    }
+    if (opts.maxAgeHours !== undefined) {
+      config.autoAnchor.maxAgeHours = opts.maxAgeHours;
+      changed = true;
+    }
+    if (opts.tsa !== undefined) {
+      config.autoAnchor.tsaUrl = opts.tsa;
+      changed = true;
+    }
+
+    if (changed) {
+      saveConfig(configPath, config);
+      console.log(`설정을 저장했습니다: ${configPath}`);
+    }
+
+    console.log(JSON.stringify(config, null, 2));
+    if (!config.autoAnchor.enabled) {
+      console.log(
+        "\n자동 앵커링이 꺼져 있습니다 — 기본값은 off이며, 매 커밋마다 네트워크 호출이 " +
+          "생기는 걸 원치 않는 저장소에서의 안전한 기본 동작입니다. " +
+          "켜려면: vibe-supervisor config --auto-anchor on"
+      );
     }
   });
 

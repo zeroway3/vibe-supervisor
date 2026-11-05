@@ -130,7 +130,8 @@ export async function verifyTimestampToken(
 
 export async function requestTimestamp(
   data: Buffer,
-  tsaUrl: string = KNOWN_TSA_URLS.freetsa
+  tsaUrl: string = KNOWN_TSA_URLS.freetsa,
+  signal?: AbortSignal
 ): Promise<TimestampResult> {
   const messageImprint = await pkijs.MessageImprint.create("SHA-256", new Uint8Array(data));
   const nonceBytes = randomBytes(8);
@@ -151,6 +152,7 @@ export async function requestTimestamp(
     method: "POST",
     headers: { "Content-Type": "application/timestamp-query" },
     body: new Uint8Array(reqDer),
+    signal,
   });
   if (!res.ok) {
     throw new Error(`TSA 요청 실패: HTTP ${res.status}`);

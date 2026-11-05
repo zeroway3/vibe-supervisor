@@ -64,9 +64,23 @@ AI 생성 코드에 대한 감독 계층. 탐지 정확도로 경쟁하지 않�
 
 **테스트**: `npm test` — 원장 payload 변조, 구버전 원장 호환, 발견사항 DB 변조·삭제·삽입, 트레일러 판정.
 
+**앵커 자동 스케줄링**
+- 기본은 off — 매 커밋마다 외부 TSA 네트워크 호출이 생기는 걸 원치 않을 수 있어서,
+  설치 직후엔 지금까지처럼 수동 `anchor`만 동작한다.
+- `config --auto-anchor on`으로 켜면, post-commit 훅이 매 커밋 뒤 "마지막 앵커 이후
+  커밋 N건 경과" 또는 "마지막 앵커 이후 N시간 경과" 중 하나라도 차면 알아서 TSA에
+  타임스탬프를 요청해 저장한다. 두 기준 다 기본 `.vibe-supervisor/config.json`에서
+  조정 가능(`everyNCommits`, `maxAgeHours`).
+- 네트워크가 느리거나 끊겨 있어도 커밋 자체는 절대 막지 않는다 — 요청에 타임아웃을
+  걸고, 실패하면 경고만 찍고 조건은 그대로 남겨 다음 커밋에서 재시도한다.
+- 버그 하나 잡음: 앵커가 한 번도 없을 때 "마지막 앵커 이후 경과 시간"을 `Infinity`로
+  두면 시간 조건이 커밋 수와 무관하게 항상 참이 돼서 everyNCommits 설정을 무시하고
+  첫 커밋부터 바로 앵커링되는 문제가 있었다 — 재현 테스트로 확인 후, 앵커가 없을 땐
+  원장의 첫 기록 시각을 기준 시각으로 쓰도록 고쳤다.
+
 아직 안 만든 것(다음 단계): IDE 확장 이벤트 캡처(조사해보니 Copilot은 외부 확장에 수락
 이벤트를 공식 API로 안 열어줘서 완전한 구현이 어려움 — 지금 있는 커밋 트레일러 방식이
-더 안정적인 1차 신호), 편집 패턴 분석, 앵커 자동 스케줄링(지금은 수동 `anchor` 호출),
+더 안정적인 1차 신호), 편집 패턴 분석,
 승인자 신원 강화(지금은 git 이메일 — 서명 커밋/SSO), 전체 검사(`scan --all`)도 재검사 근거로 쓸 수 있게 대상 파일 목록 기록,
 외부 도구 SARIF 가져오기.
 
@@ -102,6 +116,9 @@ node /path/to/vibe-supervisor/dist/cli/index.js report
 # 인쇄·제출용 HTML (브라우저에서 열고 '인쇄 / PDF로 저장' → PDF. 발견사항 표는 가로 페이지)
 node /path/to/vibe-supervisor/dist/cli/index.js report -o report.html
 
-# 원장 끝 해시를 외부 TSA에 등록 (소급 재생성 방지)
+# 원장 끝 해시를 외부 TSA에 등록 (소급 재생성 방지, 수동)
 node /path/to/vibe-supervisor/dist/cli/index.js anchor
+
+# 매 커밋 뒤 조건 충족 시 자동으로 anchor까지 실행 (기본 off)
+node /path/to/vibe-supervisor/dist/cli/index.js config --auto-anchor on --every-n-commits 10 --max-age-hours 24
 ```
