@@ -30,6 +30,12 @@ function originStats(entries: LedgerEntry[]) {
     .filter((r): r is number => r !== null);
   const tools = new Map<string, number>();
   for (const e of commits) if (e.aiTool) tools.set(e.aiTool, (tools.get(e.aiTool) ?? 0) + 1);
+  // 서명 통계는 payload.signature가 있는 커밋만 센다(이 필드가 생기기 전
+  // 원장은 "알 수 없음"이지 "미서명"이 아니다 — 구분해서 표기).
+  const withSignatureInfo = commits.filter((e) => e.payload?.kind === "generated" && e.payload.signature);
+  const signed = withSignatureInfo.filter(
+    (e) => e.payload?.kind === "generated" && e.payload.signature?.status === "good"
+  ).length;
   return {
     total: commits.length,
     confirmed: count("confirmed"),
@@ -38,6 +44,8 @@ function originStats(entries: LedgerEntry[]) {
     avgRatio: ratios.length > 0 ? ratios.reduce((a, b) => a + b, 0) / ratios.length : null,
     ratioSamples: ratios.length,
     tools,
+    signed,
+    signatureKnown: withSignatureInfo.length,
     byCommit: new Map(commits.map((e) => [e.commitHash, e])),
   };
 }
@@ -245,6 +253,8 @@ ${
 ${origin.tools.size > 0 ? `도구별: ${[...origin.tools].map(([t, n]) => `${t} ${n}건`).join(", ")}` : ""}
 
 ${origin.avgRatio !== null ? `선언된 AI 생성 비율 평균: ${(origin.avgRatio * 100).toFixed(0)}% (선언 ${origin.ratioSamples}건 기준)` : ""}
+
+${origin.signatureKnown > 0 ? `커밋 서명(GPG/SSH): ${origin.signed}/${origin.signatureKnown}건이 서명됨 (${pct(origin.signed, origin.signatureKnown)}). \`actor\`(git 이메일)는 누구나 임의로 설정할 수 있어 신원 근거로는 약합니다 — 서명된 커밋만 "이 키 소유자가 작성"이라는 더 강한 근거를 갖습니다.` : ""}
 
 > 도구가 판단하지 못한 부분("미상")을 숨기지 않고 그대로 표기합니다 — 정확도를
 > 과장하지 않는 것이 증빙 자료로서는 더 신뢰할 수 있다는 판단입니다.

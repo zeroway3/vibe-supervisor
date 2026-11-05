@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Ledger } from "../ledger/db.js";
 import { parseAiTrailer } from "../trailer/parse.js";
+import { getCommitSignature } from "../trailer/signature.js";
 import { isSemgrepAvailable, scanAndRecord } from "../scan/run.js";
 import { FindingsStore } from "../findings/store.js";
 import { rescanEvidence } from "../ledger/rescan.js";
@@ -140,6 +141,7 @@ async function main() {
   });
 
   const { aiTool, aiRatio, confidence, originSource } = parseAiTrailer(commitMessage);
+  const signature = getCommitSignature(repoRoot, commitHash);
 
   const dbPath = join(repoRoot, ".vibe-supervisor", "ledger.db");
   const ledger = new Ledger(dbPath);
@@ -150,7 +152,7 @@ async function main() {
     aiTool,
     originConfidence: confidence,
     fileHashes,
-    payload: { kind: "generated", aiRatio, originSource },
+    payload: { kind: "generated", aiRatio, originSource, signature },
   });
   const allEntries = ledger.all();
   ledger.close();
@@ -158,7 +160,8 @@ async function main() {
   console.log(
     `[vibe-supervisor] 커밋 ${commitHash.slice(0, 8)} 기록 완료 — ` +
       `출처: ${confidence}${aiTool ? ` (${aiTool}${aiRatio !== null ? `, ratio=${aiRatio}` : ""})` : ""}, ` +
-      `파일 ${fileHashes.length}개, 원장 #${entry.id}`
+      `파일 ${fileHashes.length}개, 원장 #${entry.id}, 서명: ${signature.status}` +
+      `${signature.signer ? ` (${signature.signer})` : ""}`
   );
 
   // 커밋 시점 증분 검사 — 바뀐 파일만 본다(전체 검사는 느려서 개발자가 꺼버린다).

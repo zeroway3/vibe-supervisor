@@ -20,6 +20,11 @@ export type LedgerPayload =
       aiRatio: number | null;
       /** 출처를 판정한 근거 — "ai-generated-trailer" | "co-author-trailer" | "none" */
       originSource: string;
+      /** 이 커밋이 GPG/SSH로 서명됐는지. actor(git 이메일)는 누구나 자유롭게
+       * 설정할 수 있어 신원 근거로 약하다 — 서명이 있으면 "이 키의 소유자가
+       * 만든 커밋"이라는 더 강한 근거가 된다. 선택 필드라 이 필드가 생기기
+       * 전 원장도 그대로 검증된다. */
+      signature?: { status: string; signer: string | null };
     }
   | {
       kind: "detected";
