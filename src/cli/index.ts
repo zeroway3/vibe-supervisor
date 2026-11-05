@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { Ledger } from "../ledger/db.js";
 import { FindingsStore } from "../findings/store.js";
 import { isSemgrepAvailable, scanAndRecord } from "../scan/run.js";
+import { importSarif } from "../scan/sarif-import.js";
 import { generateReport } from "../report/generate.js";
 import { renderReportHtml } from "../report/html.js";
 import { AnchorStore } from "../timestamp/store.js";
@@ -304,6 +305,36 @@ program
     for (const f of findings) {
       console.log(`  #${f.id} [${f.severity}] ${f.ruleId}  ${f.file}:${f.line}  — ${f.ismspClause}`);
     }
+  });
+
+program
+  .command("import-sarif <sarifFile>")
+  .description("semgrep이 아닌 외부 SAST/DAST 도구의 SARIF 결과를 발견사항·원장에 편입시킨다")
+  .option("--tool <name>", "도구 이름(생략 시 SARIF의 tool.driver.name을 사용)")
+  .action((sarifFile, opts) => {
+    const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
+    const commitHash = git(["rev-parse", "HEAD"], repoRoot);
+    const actor = git(["config", "user.email"], repoRoot) || "unknown";
+
+    let result: ReturnType<typeof importSarif>;
+    try {
+      result = importSarif(repoRoot, sarifFile, commitHash, actor, opts.tool);
+    } catch (err: any) {
+      console.error(`SARIF 가져오기 실패: ${err.message}`);
+      process.exit(1);
+    }
+
+    console.log(
+      `[vibe-supervisor] ${result.info.toolName} 결과 가져오기 완료 — 발견 ${result.findings.length}건 ` +
+        `(파일 hash=${result.info.fileHash.slice(0, 12)}…)`
+    );
+    for (const f of result.findings) {
+      console.log(`  #${f.id} [${f.severity}] ${f.ruleId}  ${f.file}:${f.line}  — ${f.ismspClause}`);
+    }
+    console.log(
+      "  → 어떤 파일을 스캔했는지는 통제할 수 없어 재검사 근거로는 쓰이지 않습니다 — " +
+        "'approve <번호> [--fixed | --exception]'으로 직접 처리하세요."
+    );
   });
 
 program

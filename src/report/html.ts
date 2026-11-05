@@ -161,11 +161,14 @@ table.kv th:first-child, table.kv td:first-child { width: 32%; background: #f9fa
 table.wide { font-size: 8pt; }
 table.wide th { white-space: nowrap; }
 table.wide td { overflow-wrap: anywhere; }
-/* 번호·심각도·커밋·시각·상태처럼 짧은 칸은 줄바꿈하지 않는다 — 좁은 A4 폭에서
-   글자 단위로 쪼개지면 읽을 수 없다. 남는 폭은 파일 경로·사유 칸이 가져간다. */
-table.wide td:nth-child(1), table.wide td:nth-child(3), table.wide td:nth-child(8) { white-space: nowrap; }
+/* 번호·심각도·탐지도구·시각·상태처럼 짧은 칸은 줄바꿈하지 않는다 — 좁은 A4 폭에서
+   글자 단위로 쪼개지면 읽을 수 없다. 남는 폭은 파일 경로·사유 칸이 가져간다.
+   findings 표 칸 순서: 1#, 2규칙, 3심각도, 4파일:라인, 5출처(커밋), 6탐지도구,
+   7관련기준, 8탐지시각, 9상태, 10처리시각, 11처리자 — 칸을 추가/재배치하면 이
+   번호도 같이 고쳐야 한다. */
+table.wide td:nth-child(1), table.wide td:nth-child(3), table.wide td:nth-child(6), table.wide td:nth-child(9) { white-space: nowrap; }
 /* 시각 칸은 날짜와 시각 사이 공백에서만 줄을 바꾼다. */
-table.wide td:nth-child(7), table.wide td:nth-child(9) { overflow-wrap: normal; }
+table.wide td:nth-child(8), table.wide td:nth-child(10) { overflow-wrap: normal; }
 td.ok, h1.ok { color: #047857; }
 td.warn { color: #b45309; font-weight: bold; }
 td.bad { color: #b91c1c; font-weight: bold; }
@@ -176,7 +179,7 @@ td.bad { color: #b91c1c; font-weight: bold; }
 @media print {
   .landscape { page: landscape; }
   .landscape table.wide { font-size: 8.5pt; }
-  .landscape table.wide td:nth-child(7), .landscape table.wide td:nth-child(9) { white-space: nowrap; }
+  .landscape table.wide td:nth-child(8), .landscape table.wide td:nth-child(10) { white-space: nowrap; }
   body { background: #fff; font-size: 9.5pt; }
   main { margin: 0; padding: 0; max-width: none; box-shadow: none; }
   .toolbar { display: none; }

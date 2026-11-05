@@ -67,6 +67,37 @@ function detectionTimes(entries: LedgerEntry[]): Map<number, string> {
   return m;
 }
 
+/** 발견사항이 어느 룰셋/도구에서 나왔는지. semgrep은 고정 룰셋 파일 해시를,
+ * import-sarif로 들어온 건 "external:<도구명>" + 가져온 SARIF 파일 해시를
+ * 쓴다 — 전부 같은 ruleset으로 나왔다고 전제하면 안 된다(여러 출처가 섞일 수
+ * 있음). */
+interface DetectionSource {
+  version: string;
+  hash: string;
+}
+
+function detectionSources(entries: LedgerEntry[]): Map<number, DetectionSource> {
+  const m = new Map<number, DetectionSource>();
+  for (const e of entries) {
+    if (e.payload?.kind !== "detected") continue;
+    const source = { version: e.payload.rulesetVersion, hash: e.payload.rulesetHash };
+    for (const f of e.payload.findings) m.set(f.findingId, source);
+  }
+  return m;
+}
+
+/** 리포트 요약(1·5장)에 쓸, 이 기간에 실제로 쓰인 서로 다른 탐지 출처 목록.
+ * 하나뿐이면 지금까지처럼 input.ruleset(semgrep 고정 룰셋)만 보여주면 되지만,
+ * SARIF를 가져온 적이 있으면 그 출처도 같이 나열해야 "룰셋 X로만 재현 가능"이라는
+ * 말이 거짓이 되지 않는다. */
+function distinctSources(entries: LedgerEntry[], fallback: DetectionSource): DetectionSource[] {
+  const sources = detectionSources(entries);
+  const seen = new Map<string, DetectionSource>();
+  for (const s of sources.values()) seen.set(`${s.version}:${s.hash}`, s);
+  if (seen.size === 0) return [fallback];
+  return [...seen.values()];
+}
+
 /** 표 칸에 들어가는 사용자 입력(승인 사유·이메일 등)의 세로선·줄바꿈이 표를
  * 깨지 않게 한다. */
 function cell(s: string): string {
@@ -90,6 +121,7 @@ function statusText(status: Finding["status"], ev: RescanEvidence | undefined): 
 function findingsTable(findings: ReportFinding[], audit: ReportAudit, origin: ReturnType<typeof originStats>): string {
   if (findings.length === 0) return "_이 기간 동안 탐지된 항목이 없습니다._";
   const detected = detectionTimes(audit.entries);
+  const sources = detectionSources(audit.entries);
   const approved = approvalTimes(audit.entries);
   const issueIds = new Set(audit.crossCheck.issues.map((i) => i.findingId));
   const rescan = rescanEvidence(
@@ -98,8 +130,8 @@ function findingsTable(findings: ReportFinding[], audit: ReportAudit, origin: Re
   );
 
   const header =
-    "| # | 규칙 | 심각도 | 파일:라인 | 출처 | 관련 기준(취약점 유형) | 탐지 시각 | 상태 | 처리 시각 | 처리자 — 사유 |\n" +
-    "|---|---|---|---|---|---|---|---|---|---|";
+    "| # | 규칙 | 심각도 | 파일:라인 | 출처(커밋) | 탐지 도구 | 관련 기준(취약점 유형) | 탐지 시각 | 상태 | 처리 시각 | 처리자 — 사유 |\n" +
+    "|---|---|---|---|---|---|---|---|---|---|---|";
   const rows = findings.map((f, idx) => {
     const id = f.id ?? idx + 1;
     const ev = f.id !== undefined ? rescan.get(f.id) : undefined;
@@ -107,9 +139,10 @@ function findingsTable(findings: ReportFinding[], audit: ReportAudit, origin: Re
     const actor = f.approvedBy ? cell(`${f.approvedBy}${f.approvalNote ? ` — ${f.approvalNote}` : ""}`) : "-";
     const commit = f.commitHash ? origin.byCommit.get(f.commitHash) : undefined;
     const src = commit ? `${commit.originConfidence}${commit.aiTool ? ` (${commit.aiTool})` : ""}` : "-";
+    const tool = f.id !== undefined ? sources.get(f.id)?.version ?? "-" : "-";
     const flag = issueIds.has(id) ? " ❌원장 불일치" : "";
     return (
-      `| ${id} | ${f.ruleId} | ${f.severity} | ${cell(f.file)}:${f.line} | ${src} | ${f.ismspClause} | ` +
+      `| ${id} | ${f.ruleId} | ${f.severity} | ${cell(f.file)}:${f.line} | ${src} | ${cell(tool)} | ${f.ismspClause} | ` +
       `${shortTime(f.id !== undefined ? detected.get(f.id) : undefined)} | ${statusLabel}${flag} | ` +
       `${shortTime(f.id !== undefined ? approved.get(f.id) : undefined)} | ${actor} |`
     );
@@ -155,6 +188,7 @@ function anchorSummary(checks: AnchorCheck[]): { label: string; detail: string }
 export function generateReport(input: ReportInput, audit: ReportAudit): string {
   const findings = input.findings as ReportFinding[];
   const origin = originStats(audit.entries);
+  const sourcesUsed = distinctSources(audit.entries, { version: input.ruleset.version, hash: input.ruleset.hash });
   const unapproved = findings.filter((f) => f.status === "open");
   const exceptions = findings.filter((f) => f.status === "exception");
   const fixedCount = findings.filter((f) => f.status === "fixed").length;
@@ -189,7 +223,7 @@ ${warningBlock}
 |---|---|
 | 대상 저장소 | ${cell(input.repoName)} |
 | 집계 기간 | ${input.periodStart} ~ ${input.periodEnd} |
-| 룰셋 버전 | ${input.ruleset.version} (hash: \`${input.ruleset.hash.slice(0, 16)}…\`) |
+| 룰셋 버전 | ${input.ruleset.version} (hash: \`${input.ruleset.hash.slice(0, 16)}…\`)${sourcesUsed.length > 1 ? ` — 그 외 탐지 출처 ${sourcesUsed.length - 1}건 추가 (5장 참고)` : ""} |
 | 생성 시각 | ${new Date().toISOString()} |
 | 원장 무결성 (해시 체인) | ${audit.integrity.ok ? "✅ 정상 (변조 흔적 없음)" : `❌ 깨짐 — id=${audit.integrity.brokenAtId} 이후`} |
 | 발견사항·승인 기록 대조 | ${ccLabel} |
@@ -261,10 +295,23 @@ ${origin.signatureKnown > 0 ? `커밋 서명(GPG/SSH): ${origin.signed}/${origin
 
 ## 5. 재현 가능성
 
-이 리포트는 룰셋 버전 \`${input.ruleset.version}\`(hash \`${input.ruleset.hash.slice(0, 16)}…\`)로
+${
+  sourcesUsed.length <= 1
+    ? `이 리포트는 룰셋 버전 \`${sourcesUsed[0].version}\`(hash \`${sourcesUsed[0].hash.slice(0, 16)}…\`)로
 고정된 상태에서 생성되었습니다. 같은 커밋 범위에 같은 룰셋 버전으로 다시
 생성해도 동일한 결과가 나옵니다 — 생성 시점에 따라 결과가 달라지는 LLM 단독
-도구와의 핵심 차이점입니다.
+도구와의 핵심 차이점입니다.`
+    : `이 기간에는 서로 다른 탐지 출처 ${sourcesUsed.length}건이 섞여 있습니다 — 전부
+같은 룰셋이라고 전제하면 안 됩니다. 각 출처는 독립적으로 고정·재현 가능합니다:
+
+| 출처 | 해시 |
+|---|---|
+${sourcesUsed.map((s) => `| \`${s.version}\` | \`${s.hash.slice(0, 16)}…\` |`).join("\n")}
+
+\`external:\`로 시작하는 항목은 semgrep이 아니라 \`import-sarif\`로 가져온 외부
+도구 결과입니다 — 해시는 우리 룰셋이 아니라 가져온 SARIF 파일 자체의 해시이며,
+그 도구의 스캔 로직 자체를 우리가 고정·검증한 것은 아닙니다.`
+}
 
 ## 6. 기록의 무결성 — 어떻게 믿을 수 있는가
 
@@ -283,8 +330,9 @@ ${anchors.detail}
 
 ### 알려진 한계
 
-- 처리자 신원은 git 설정의 이메일입니다. 개인 서명(GPG/SSH)이나 SSO 연동 전까지는
-  "누가"가 자기신고에 가깝습니다.
+- 커밋 생성 시점의 서명 여부는 4장에 표기되지만(위 서명률 참고), **승인/예외
+  처리(approve) 행위 자체**는 여전히 git 설정의 이메일만 믿습니다. SSO 연동
+  전까지는 "누가 처리했는가"가 승인 단계에서는 자기신고에 가깝습니다.
 - 앵커와 앵커 사이 구간은 다음 앵커 전까지 외부 보증이 없습니다. 앵커 주기가 곧 보증 간격입니다.
 
 ## 부록. 감독 원장 상세

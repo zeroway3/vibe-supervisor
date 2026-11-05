@@ -35,6 +35,18 @@ AI 생성 코드에 대한 감독 계층. 탐지 정확도로 경쟁하지 않�
 - SARIF의 OWASP 태그를 ISMS-P 영역명에 대략 매핑하되, 전부 `[확인 필요]`를 붙여
   심사 근거로 바로 인용하지 못하게 한다(현직 심사원 검증 전까지는 추정값).
 
+**외부 도구 SARIF 가져오기**
+- `import-sarif <파일> [--tool 이름]`로 semgrep이 아닌 다른 SAST/DAST 도구(조직에
+  이미 있는 상용 스캐너 등)의 SARIF 2.1.0 결과도 같은 findings.db·원장 경로로
+  편입시킬 수 있다. 재현성 근거는 우리 룰셋 해시 대신 "가져온 SARIF 파일 자체의
+  해시"를 쓴다 — 그 도구의 스캔 로직까지 우리가 고정·검증했다고 주장하지 않는다.
+- 어떤 파일을 스캔했는지는 통제할 수 없으므로 fileHashes를 비워 둔다 — 그래서
+  재검사 근거(조치 완료 판정)로는 안 쓰인다. 직접 `approve`로 처리해야 한다.
+- 리포트는 출처가 섞이면(semgrep + 외부 도구) "탐지 도구" 칸과 5장에 각 출처를
+  따로 나열한다 — "이 룰셋 하나로 전부 재현 가능"이라는 말이 거짓이 되지 않게.
+- 실제 가짜 SARIF 파일(FakeSAST 도구, XSS 1건)을 semgrep 발견사항과 함께 가져와
+  리포트(마크다운·HTML 둘 다)가 두 출처를 올바르게 구분해 보여주는 걸 확인했다.
+
 **승인 플로우**
 - `approve <id>`로 발견사항을 **조치 완료(`--fixed`) / 승인(위험 수용) / 예외(`--exception`)** 중 하나로 처리하고,
   그 행위 자체를 원장에 기록한다. 조치 완료는 조치 내용, 예외는 사유(`--note`)가 필수.
@@ -94,8 +106,7 @@ AI 생성 코드에 대한 감독 계층. 탐지 정확도로 경쟁하지 않�
 이벤트를 공식 API로 안 열어줘서 완전한 구현이 어려움 — 지금 있는 커밋 트레일러 방식이
 더 안정적인 1차 신호), 편집 패턴 분석,
 `approve` 행위 자체의 신원 강화(지금은 커밋 서명 추적이 `generated` 이벤트에만 있고,
-승인/예외 처리는 여전히 git 이메일만 믿는다 — SSO 연동이 더 근본적인 해법), 외부 도구
-SARIF 가져오기.
+승인/예외 처리는 여전히 git 이메일만 믿는다 — SSO 연동이 더 근본적인 해법).
 
 ## 빠른 시작
 
@@ -118,6 +129,9 @@ node /path/to/vibe-supervisor/dist/cli/index.js verify
 
 # 방금 커밋에서 바뀐 파일만 검사 (전체 검사는 --all)
 node /path/to/vibe-supervisor/dist/cli/index.js scan
+
+# 다른 SAST/DAST 도구의 SARIF 결과도 같이 편입 (선택)
+node /path/to/vibe-supervisor/dist/cli/index.js import-sarif other-tool-results.sarif --tool "SomeScanner"
 
 # 발견사항 승인 (scan 출력에 찍히는 번호로)
 node /path/to/vibe-supervisor/dist/cli/index.js approve 1 --fixed --note "환경변수로 이관"
