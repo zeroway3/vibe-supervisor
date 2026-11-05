@@ -7,10 +7,13 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Ledger } from "../ledger/db.js";
 import { FindingsStore } from "../findings/store.js";
-import { runSemgrepScan } from "../scan/semgrep.js";
+import { isSemgrepAvailable, scanAndRecord } from "../scan/run.js";
 import { generateReport } from "../report/generate.js";
+import { renderReportHtml } from "../report/html.js";
 import { AnchorStore } from "../timestamp/store.js";
 import { requestTimestamp, KNOWN_TSA_URLS } from "../timestamp/rfc3161.js";
+import { runAudit } from "../audit.js";
+import { DECISION_LABEL, type FindingDecision } from "../report/types.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const HOOK_SCRIPT = join(__dirname, "..", "hooks", "post-commit.js");
@@ -24,6 +27,24 @@ function vsDir(repoRoot: string) {
 
 function git(args: string[], cwd: string): string {
   return execFileSync("git", args, { cwd, encoding: "utf-8" }).trim();
+}
+
+function requireLedger(repoRoot: string): string {
+  const ledgerPath = join(vsDir(repoRoot), "ledger.db");
+  if (!existsSync(ledgerPath)) {
+    console.error("원장이 아직 없습니다 — 커밋을 먼저 해보세요.");
+    process.exit(1);
+  }
+  return ledgerPath;
+}
+
+function readTrustedPem(path: string | undefined): string | undefined {
+  if (!path) return undefined;
+  if (!existsSync(path)) {
+    console.error(`신뢰 루트 인증서 파일이 없습니다: ${path}`);
+    process.exit(1);
+  }
+  return readFileSync(path, "utf-8");
 }
 
 const program = new Command();
@@ -46,67 +67,71 @@ program
       process.exit(1);
     }
 
-    writeFileSync(hookPath, `#!/bin/sh\nnode "${HOOK_SCRIPT}"\n`);
+    // Windows 경로의 역슬래시는 sh에서 이스케이프로 읽히므로 슬래시로 바꾼다.
+    writeFileSync(hookPath, `#!/bin/sh\nnode "${HOOK_SCRIPT.replace(/\\/g, "/")}"\n`);
     chmodSync(hookPath, 0o755);
     console.log(`post-commit 훅을 설치했습니다: ${hookPath}`);
+    if (!isSemgrepAvailable()) {
+      console.log("(참고) semgrep이 없어 커밋 시점 검사는 건너뜁니다. 'pip install semgrep' 또는 'docker pull semgrep/semgrep:1.95.0' 후 자동으로 동작합니다.");
+    }
   });
 
 program
   .command("verify")
-  .description("감독 원장의 해시 체인 무결성 + 외부 타임스탬프 앵커를 검증한다")
-  .action(() => {
+  .description("원장 해시 체인 + 발견사항·승인 대조 + 외부 타임스탬프 서명까지 검증한다")
+  .option("--tsa-ca <pem>", "TSA 신뢰 루트 인증서(PEM). 주면 서명자 인증서 체인까지 확인한다")
+  .action(async (opts) => {
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
-    const dbPath = join(repoRoot, ".vibe-supervisor", "ledger.db");
-    if (!existsSync(dbPath)) {
-      console.error("원장이 아직 없습니다 — 커밋을 먼저 해보세요.");
-      process.exit(1);
-    }
-    const ledger = new Ledger(dbPath);
-    const result = ledger.verify();
-    const entries = ledger.all();
-    ledger.close();
+    requireLedger(repoRoot);
+    const audit = await runAudit(repoRoot, readTrustedPem(opts.tsaCa));
 
-    if (result.ok) {
-      console.log("체인 무결성 OK — 변조 흔적 없음.");
+    // 1) 해시 체인
+    if (audit.integrity.ok) {
+      console.log(`[1/3] 체인 무결성 OK — 원장 ${audit.entries.length}건, 변조 흔적 없음.`);
     } else {
-      console.error(`체인 깨짐 — id=${result.brokenAtId} 이후 기록이 원래 해시와 안 맞습니다.`);
-      process.exit(1);
+      console.error(`[1/3] 체인 깨짐 — id=${audit.integrity.brokenAtId} 이후 기록이 원래 해시와 안 맞습니다.`);
     }
 
-    // 앵커 검증: "지금 체인을 통째로 새로 만든 게 아니라, 외부 TSA가 과거에
-    // 도장 찍어준 그 시점까지는 진짜로 그대로 이어져 왔다"를 확인한다.
-    // 체인 해시 자체가 OK여도, 전체를 처음부터 다시 만들면 내부적으로는
-    // 일관된 새 체인이 되므로(이게 Q4-2에서 스스로 짚은 구멍) — 앵커가 그
-    // "다시 만들었는지"를 외부 기준으로 잡아낸다.
-    const anchorDbPath = join(repoRoot, ".vibe-supervisor", "anchors.db");
-    if (existsSync(anchorDbPath)) {
-      const anchorStore = new AnchorStore(anchorDbPath);
-      const anchors = anchorStore.all();
-      anchorStore.close();
+    // 2) findings.db는 체인 밖이라, 체인에 고정된 탐지·승인 기록과 대조한다.
+    const cc = audit.crossCheck;
+    if (cc.issues.length === 0) {
+      console.log(
+        `[2/3] 발견사항·승인 대조 OK — ${cc.verified}건 원장과 일치` +
+          `${cc.unverifiable > 0 ? ` (구버전 기록 ${cc.unverifiable}건은 대조 근거 없음)` : ""}.`
+      );
+    } else {
+      console.error(`[2/3] 발견사항·승인 기록 불일치 ${cc.issues.length}건:`);
+      for (const i of cc.issues) console.error(`  - 발견사항 #${i.findingId}: ${i.message}`);
+    }
 
-      let anchorsOk = true;
-      for (const a of anchors) {
-        const entry = entries.find((e) => e.id === a.ledgerEntryId);
-        if (!entry || entry.hash !== a.anchoredHash) {
-          console.error(
-            `앵커 #${a.id} 불일치 — 원장 #${a.ledgerEntryId}의 현재 해시가 ` +
-              `${a.tsaUrl}가 ${a.genTime}에 서명한 해시(${a.anchoredHash.slice(0, 16)}…)와 다릅니다. ` +
-              `이 시점 이전 기록이 나중에 통째로 다시 생성됐을 가능성이 있습니다.`
-          );
-          anchorsOk = false;
-        }
-      }
-      if (anchorsOk && anchors.length > 0) {
-        const latest = anchors[anchors.length - 1];
-        console.log(
-          `외부 타임스탬프 앵커 ${anchors.length}건 전부 일치 — ` +
-            `가장 최근 앵커(${latest.genTime}, ${latest.tsaUrl}) 시점까지는 소급 재생성되지 않았음을 확인.`
+    // 3) 앵커: 저장된 TSA 토큰의 서명을 검증하고, 서명된 해시가 "지금 원장"의
+    // 해당 레코드 해시와 같은지 본다. 원장을 통째로 다시 만들면(Q4-2에서 스스로
+    // 짚은 구멍) 체인은 내부적으로 일관돼도 여기서 걸린다. anchors.db까지
+    // 같이 고쳐도 TSA 서명은 다시 만들 수 없어서 걸린다.
+    if (audit.anchorChecks.length === 0) {
+      console.log("[3/3] (참고) 외부 타임스탬프 앵커가 아직 없습니다 — 'vibe-supervisor anchor'로 추가할 수 있습니다.");
+    } else {
+      for (const a of audit.anchorChecks) {
+        if (a.token.ok) continue;
+        console.error(
+          `[3/3] 앵커 #${a.anchor.id} 실패 — 원장 #${a.anchor.ledgerEntryId}: ${a.token.message} ` +
+            `이 시점 이전 기록이 나중에 다시 생성됐거나 앵커가 조작됐을 가능성이 있습니다.`
         );
       }
-      if (!anchorsOk) process.exit(1);
-    } else {
-      console.log("(참고) 외부 타임스탬프 앵커가 아직 없습니다 — 'vibe-supervisor anchor'로 추가할 수 있습니다.");
+      const passed = audit.anchorChecks.filter((a) => a.token.ok);
+      if (passed.length === audit.anchorChecks.length) {
+        const latest = passed[passed.length - 1].token;
+        console.log(
+          `[3/3] 외부 타임스탬프 앵커 ${passed.length}건 서명·해시 모두 일치 — ` +
+            `가장 최근 앵커(${latest.genTime}, 서명자 ${latest.signer}) 시점까지는 소급 재생성되지 않았음을 확인.`
+        );
+        if (!latest.chainChecked) {
+          console.log("      (참고) TSA 인증서 체인은 확인하지 않았습니다 — '--tsa-ca <루트인증서.pem>'으로 확인할 수 있습니다.");
+        }
+      }
     }
+
+    if (!audit.ok) process.exit(1);
   });
 
 program
@@ -115,24 +140,27 @@ program
   .option("--tsa <url>", "TSA 엔드포인트 URL", KNOWN_TSA_URLS.freetsa)
   .action(async (opts) => {
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
-    const ledgerPath = join(vsDir(repoRoot), "ledger.db");
-    if (!existsSync(ledgerPath)) {
-      console.error("원장이 아직 없습니다 — 커밋을 먼저 해보세요.");
-      process.exit(1);
-    }
+    const ledgerPath = requireLedger(repoRoot);
 
     const ledger = new Ledger(ledgerPath);
     const entries = ledger.all();
+    const integrity = ledger.verify();
     ledger.close();
 
     if (entries.length === 0) {
       console.error("원장에 기록이 없습니다.");
       process.exit(1);
     }
+    // 이미 깨진 체인에 도장을 찍으면 "깨진 상태"를 외부 기관이 보증해주는 꼴이 된다.
+    if (!integrity.ok) {
+      console.error(`체인이 깨져 있어 앵커를 등록하지 않습니다 (id=${integrity.brokenAtId}). 'verify'로 먼저 확인하세요.`);
+      process.exit(1);
+    }
     const tip = entries[entries.length - 1];
 
     console.log(`[vibe-supervisor] ${opts.tsa}에 원장 #${tip.id}(hash=${tip.hash.slice(0, 16)}…) 타임스탬프 요청 중...`);
     try {
+      // requestTimestamp 안에서 nonce·imprint·서명을 확인한 토큰만 돌려준다.
       const result = await requestTimestamp(Buffer.from(tip.hash, "utf-8"), opts.tsa);
 
       const anchorStore = new AnchorStore(join(vsDir(repoRoot), "anchors.db"));
@@ -148,7 +176,7 @@ program
 
       console.log(
         `[vibe-supervisor] 앵커 #${anchor.id} 저장 완료 — TSA가 ${result.genTime}에 서명 ` +
-          `(serial=${result.serialNumberHex}). 'verify'로 언제든 재확인 가능.`
+          `(serial=${result.serialNumberHex}, 서명·nonce 검증 통과). 'verify'로 언제든 재확인 가능.`
       );
     } catch (err: any) {
       console.error(`타임스탬프 요청 실패: ${err.message}`);
@@ -161,20 +189,20 @@ program
   .description("원장에 쌓인 기록을 최근순으로 보여준다")
   .action(() => {
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
-    const dbPath = join(repoRoot, ".vibe-supervisor", "ledger.db");
-    if (!existsSync(dbPath)) {
-      console.error("원장이 아직 없습니다 — 커밋을 먼저 해보세요.");
-      process.exit(1);
-    }
-    const ledger = new Ledger(dbPath);
+    const ledger = new Ledger(requireLedger(repoRoot));
     const entries = ledger.all();
     ledger.close();
 
     for (const e of entries.slice().reverse()) {
+      const p = e.payload;
+      const detail =
+        p?.kind === "detected"
+          ? `탐지 ${p.findings.length}건`
+          : p?.kind === "approved"
+            ? `발견사항 #${p.findingId} ${DECISION_LABEL[p.decision]}`
+            : `${e.originConfidence}${e.aiTool ? `(${e.aiTool}${p?.kind === "generated" && p.aiRatio !== null ? `, ratio=${p.aiRatio}` : ""})` : ""}  파일 ${e.fileHashes.length}개`;
       console.log(
-        `#${e.id}  ${e.timestamp}  ${e.commitHash.slice(0, 8)}  ` +
-          `${e.originConfidence}${e.aiTool ? `(${e.aiTool})` : ""}  ` +
-          `파일 ${e.fileHashes.length}개  hash=${e.hash.slice(0, 12)}…`
+        `#${e.id}  ${e.timestamp}  ${e.eventType.padEnd(9)} ${e.commitHash.slice(0, 8)}  ${e.actor}  ${detail}  hash=${e.hash.slice(0, 12)}…`
       );
     }
   });
@@ -187,10 +215,15 @@ program
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
     const commitHash = git(["rev-parse", "HEAD"], repoRoot);
 
+    if (!isSemgrepAvailable()) {
+      console.error("semgrep을 찾을 수 없습니다 — 'pip install semgrep' 또는 'docker pull semgrep/semgrep:1.95.0'을 실행하세요.");
+      process.exit(1);
+    }
+
     let targetFiles: string[] | undefined;
     if (!opts.all) {
       targetFiles = git(
-        ["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", commitHash],
+        ["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", "--diff-filter=d", commitHash],
         repoRoot
       )
         .split("\n")
@@ -202,90 +235,91 @@ program
     }
 
     console.log(`[vibe-supervisor] semgrep 스캔 중... (${targetFiles ? `${targetFiles.length}개 파일, 증분` : "저장소 전체"})`);
-    const { findings, ruleset } = runSemgrepScan(repoRoot, RULESET_PATH, targetFiles);
-
-    const findingsStore = new FindingsStore(join(vsDir(repoRoot), "findings.db"));
-    findingsStore.saveAll(commitHash, findings);
-    findingsStore.close();
-
-    const ledger = new Ledger(join(vsDir(repoRoot), "ledger.db"));
-    ledger.append({
-      eventType: "detected",
-      commitHash,
-      actor: git(["config", "user.email"], repoRoot) || "unknown",
-      aiTool: null,
-      originConfidence: "confirmed",
-      fileHashes: (targetFiles ?? []).map((path) => ({ path, hash: "" })), // 코드 본문 저장 안 함 — 어떤 파일을 스캔했는지만 기록
-    });
-    ledger.close();
+    const actor = git(["config", "user.email"], repoRoot) || "unknown";
+    const { findings, ruleset } = scanAndRecord(repoRoot, RULESET_PATH, commitHash, actor, targetFiles);
 
     console.log(
       `[vibe-supervisor] 스캔 완료 — 발견 ${findings.length}건 ` +
         `(룰셋 ${ruleset.version}, hash=${ruleset.hash.slice(0, 12)}…)`
     );
     for (const f of findings) {
-      console.log(`  [${f.severity}] ${f.ruleId}  ${f.file}:${f.line}  — ${f.ismspClause}`);
+      console.log(`  #${f.id} [${f.severity}] ${f.ruleId}  ${f.file}:${f.line}  — ${f.ismspClause}`);
     }
   });
 
 program
   .command("approve <findingId>")
-  .description("미승인 발견사항을 승인하거나 예외 처리하고, 그 행위를 원장에 기록한다")
-  .option("--exception", "승인이 아니라 예외 처리로 기록한다 (사유를 --note로 반드시 남길 것)")
-  .option("--note <text>", "승인/예외 사유")
+  .description("미승인 발견사항을 조치 완료·승인·예외 중 하나로 처리하고, 그 행위를 원장에 기록한다")
+  .option("--fixed", "코드를 고쳐 해소했다고 기록한다 (무엇을 고쳤는지 --note로 반드시 남길 것)")
+  .option("--exception", "고치지 않고 예외로 둔다고 기록한다 (사유를 --note로 반드시 남길 것)")
+  .option("--note <text>", "조치 내용 / 승인·예외 사유")
   .action((findingIdArg, opts) => {
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
-    const findingsStore = new FindingsStore(join(vsDir(repoRoot), "findings.db"));
-    const actor = git(["config", "user.email"], repoRoot) || "unknown";
-    const status: "approved" | "exception" = opts.exception ? "exception" : "approved";
+    const findingId = Number(findingIdArg);
+    if (opts.fixed && opts.exception) {
+      console.error("--fixed와 --exception은 함께 쓸 수 없습니다.");
+      process.exit(1);
+    }
+    const status: FindingDecision = opts.fixed ? "fixed" : opts.exception ? "exception" : "approved";
+    const note: string | null = opts.note?.trim() || null;
 
-    const ok = findingsStore.approve(Number(findingIdArg), status, actor, opts.note);
-    findingsStore.close();
-
-    if (!ok) {
-      console.error(`발견사항 #${findingIdArg}을(를) 찾을 수 없습니다.`);
+    if (status !== "approved" && !note) {
+      console.error(
+        `${DECISION_LABEL[status]}는 ${status === "fixed" ? "조치 내용" : "사유"}이 필수입니다 — --note "..."를 함께 입력하세요.`
+      );
       process.exit(1);
     }
 
+    const findingsStore = new FindingsStore(join(vsDir(repoRoot), "findings.db"));
+    const target = findingsStore.get(findingId);
+    if (!target) {
+      findingsStore.close();
+      console.error(`발견사항 #${findingIdArg}을(를) 찾을 수 없습니다.`);
+      process.exit(1);
+    }
+    const actor = git(["config", "user.email"], repoRoot) || "unknown";
+
+    // 원장에 먼저 남기고 DB를 바꾼다 — 반대 순서면 DB만 바뀌고 원장 기록이
+    // 빠지는 경우가 생겨, verify가 그걸 "DB 직접 수정"으로 오인한다.
     const ledger = new Ledger(join(vsDir(repoRoot), "ledger.db"));
     ledger.append({
-      eventType: "approved",
+      eventType: status === "fixed" ? "fixed" : "approved",
       commitHash: git(["rev-parse", "HEAD"], repoRoot),
       actor,
       aiTool: null,
       originConfidence: "confirmed",
       fileHashes: [],
+      payload: {
+        kind: "approved",
+        findingId,
+        decision: status,
+        note,
+        ruleId: target.ruleId,
+        file: target.file,
+        line: target.line,
+      },
     });
     ledger.close();
 
-    console.log(`[vibe-supervisor] 발견사항 #${findingIdArg} — ${status === "approved" ? "승인" : "예외 처리"} 기록 완료 (${actor})`);
+    findingsStore.approve(findingId, status, actor, note ?? undefined);
+    findingsStore.close();
+
+    console.log(`[vibe-supervisor] 발견사항 #${findingIdArg} — ${DECISION_LABEL[status]} 기록 완료 (${actor})`);
   });
 
 program
   .command("report")
   .description("지금까지 쌓인 실제 원장·발견사항으로 감독 리포트를 생성한다")
-  .option("-o, --output <path>", "출력 파일 경로", "vibe-supervisor-report.md")
-  .action((opts) => {
+  .option(
+    "-o, --output <path>",
+    "출력 파일 경로. 확장자가 .html이면 인쇄용 HTML(브라우저에서 PDF로 저장 가능)로 만든다",
+    "vibe-supervisor-report.md"
+  )
+  .option("--tsa-ca <pem>", "TSA 신뢰 루트 인증서(PEM). 주면 앵커 검증에 인증서 체인까지 포함한다")
+  .action(async (opts) => {
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
-    const ledgerPath = join(vsDir(repoRoot), "ledger.db");
-    const findingsPath = join(vsDir(repoRoot), "findings.db");
-
-    if (!existsSync(ledgerPath)) {
-      console.error("원장이 아직 없습니다 — 커밋을 먼저 해보세요.");
-      process.exit(1);
-    }
-
-    const ledger = new Ledger(ledgerPath);
-    const entries = ledger.all();
-    const integrity = ledger.verify();
-    ledger.close();
-
-    let findings: ReturnType<FindingsStore["all"]> = [];
-    if (existsSync(findingsPath)) {
-      const findingsStore = new FindingsStore(findingsPath);
-      findings = findingsStore.all();
-      findingsStore.close();
-    }
+    requireLedger(repoRoot);
+    const audit = await runAudit(repoRoot, readTrustedPem(opts.tsaCa));
 
     const repoName = (() => {
       try {
@@ -304,7 +338,7 @@ program
       }
     })();
 
-    const timestamps = entries.map((e) => e.timestamp).sort();
+    const timestamps = audit.entries.map((e) => e.timestamp).sort();
 
     // 룰셋 hash는 가장 최근 스캔 기준 — findings가 전부 같은 룰셋 파일에서
     // 나왔다는 전제(파일이 바뀌면 다음 scan부터 새 해시가 찍힌다).
@@ -312,37 +346,23 @@ program
       ? createHash("sha256").update(readFileSync(RULESET_PATH)).digest("hex")
       : "unknown";
 
-    const anchorDbPath = join(vsDir(repoRoot), "anchors.db");
-    const anchorStatus = (() => {
-      if (!existsSync(anchorDbPath)) return undefined;
-      const anchorStore = new AnchorStore(anchorDbPath);
-      const anchors = anchorStore.all();
-      anchorStore.close();
-      if (anchors.length === 0) return undefined;
-      const allMatch = anchors.every((a) => {
-        const entry = entries.find((e) => e.id === a.ledgerEntryId);
-        return entry?.hash === a.anchoredHash;
-      });
-      const latest = anchors[anchors.length - 1];
-      return { count: anchors.length, latestGenTime: latest.genTime, latestTsaUrl: latest.tsaUrl, allMatch };
-    })();
-
     const report = generateReport(
       {
         repoName,
         periodStart: timestamps[0]?.slice(0, 10) ?? "-",
         periodEnd: timestamps[timestamps.length - 1]?.slice(0, 10) ?? "-",
         ruleset: { version: "ko-baseline-v1", hash: rulesetHash },
-        findings,
+        findings: audit.findings,
         isSample: false,
       },
-      entries,
-      integrity,
-      anchorStatus
+      audit
     );
 
-    writeFileSync(opts.output, report);
-    console.log(`[vibe-supervisor] 리포트 생성 완료: ${opts.output} (실데이터 — 원장 ${entries.length}건, 발견사항 ${findings.length}건)`);
+    writeFileSync(opts.output, /\.html?$/i.test(opts.output) ? renderReportHtml(report) : report);
+    console.log(
+      `[vibe-supervisor] 리포트 생성 완료: ${opts.output} ` +
+        `(실데이터 — 원장 ${audit.entries.length}건, 발견사항 ${audit.findings.length}건, 검증 ${audit.ok ? "통과" : "실패 항목 있음"})`
+    );
   });
 
-program.parse();
+program.parseAsync();
