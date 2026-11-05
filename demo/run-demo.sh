@@ -97,19 +97,35 @@ echo "리포트: $REPO/report.md"
 echo "인쇄용: $REPO/report.html (브라우저에서 열고 '인쇄 / PDF로 저장')"
 
 # 이하 변조 시나리오는 원본을 건드리지 않도록 복사본에서 한다.
+# expect_detected=0인 경우(DEMO_OFFLINE이라 앵커가 없을 때의 9-c)는 "미검출"이
+# 버그가 아니라 앵커 없이는 원래 못 잡는다는 걸 보여주는 의도된 결과다 — 그걸
+# "검출 실패"라고만 찍으면 발표 중 버그처럼 보인다.
 attack() {
-  local name="$1" mode="$2"
+  local name="$1" mode="$2" expect_detected="${3:-1}"
   local copy="$WORK/attack-$mode"
   rm -rf "$copy"
   cp -r "$REPO" "$copy"
   step "$name"
   node "$ROOT/demo/tamper.mjs" "$copy" "$mode"
-  (cd "$copy" && $VS verify) && echo "!! 검출 실패" || echo "→ 검출됨 (verify 실패, exit 1)"
+  if (cd "$copy" && $VS verify); then
+    if [ "$expect_detected" = "1" ]; then
+      echo "!! 검출 실패 (예상과 다릅니다 — 버그일 수 있습니다)"
+    else
+      echo "→ (예상된 결과) 미검출 — 앵커가 없는 구간은 외부 보증이 없어 이 공격을 못 잡습니다."
+      echo "   DEMO_OFFLINE 없이(실제 TSA에 등록하고) 실행하면 anchor가 이 공격을 잡아냅니다."
+    fi
+  else
+    echo "→ 검출됨 (verify 실패, exit 1)"
+  fi
 }
 
 attack "9-a. 공격: 승인 사유를 DB에서 몰래 고치기" findings-note
 attack "9-b. 공격: 미승인 항목을 원장 없이 '승인'으로 바꾸기" fake-approval
-attack "9-c. 공격: 원장 전체를 다시 계산해 AI 생성 이력 지우기 (+앵커 해시까지 수정)" rewrite-chain
+if [ "${DEMO_OFFLINE:-}" = "1" ]; then
+  attack "9-c. 공격: 원장 전체를 다시 계산해 AI 생성 이력 지우기 (+앵커 해시까지 수정)" rewrite-chain 0
+else
+  attack "9-c. 공격: 원장 전체를 다시 계산해 AI 생성 이력 지우기 (+앵커 해시까지 수정)" rewrite-chain 1
+fi
 
 echo
 echo "시연 끝. 작업 폴더: $WORK"
