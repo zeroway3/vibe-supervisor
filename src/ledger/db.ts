@@ -28,6 +28,11 @@ export class Ledger {
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(SCHEMA);
+    // payload_json은 나중에 추가된 컬럼 — 예전에 만든 원장을 열 때 보강한다.
+    const cols = this.db.prepare("PRAGMA table_info(ledger_entries)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "payload_json")) {
+      this.db.exec("ALTER TABLE ledger_entries ADD COLUMN payload_json TEXT");
+    }
   }
 
   /** 체인의 마지막 해시. 레코드가 없으면 null (제네시스 상태). */
@@ -39,7 +44,9 @@ export class Ledger {
   }
 
   /** prevHash를 포함한 정규화 필드로 해시를 계산한다. 필드 순서가 바뀌면
-   * 기존에 쓰인 모든 해시가 깨지므로 이 함수 내부 순서는 바꾸지 않는다. */
+   * 기존에 쓰인 모든 해시가 깨지므로 이 함수 내부 순서는 바꾸지 않는다.
+   * payload는 나중에 추가된 필드라, payload가 없는 레코드는 예전과 똑같은
+   * 정규형으로 해시한다 — 그래야 기존 원장이 그대로 검증된다. */
   private computeHash(
     prevHash: string | null,
     timestamp: string,
@@ -54,6 +61,7 @@ export class Ledger {
       aiTool: input.aiTool,
       originConfidence: input.originConfidence,
       fileHashes: input.fileHashes,
+      ...(input.payload ? { payload: input.payload } : {}),
     });
     return createHash("sha256").update(canonical).digest("hex");
   }
@@ -66,8 +74,8 @@ export class Ledger {
     const result = this.db
       .prepare(
         `INSERT INTO ledger_entries
-         (timestamp, prev_hash, event_type, commit_hash, actor, ai_tool, origin_confidence, file_hashes_json, hash)
-         VALUES (@timestamp, @prevHash, @eventType, @commitHash, @actor, @aiTool, @originConfidence, @fileHashesJson, @hash)`
+         (timestamp, prev_hash, event_type, commit_hash, actor, ai_tool, origin_confidence, file_hashes_json, payload_json, hash)
+         VALUES (@timestamp, @prevHash, @eventType, @commitHash, @actor, @aiTool, @originConfidence, @fileHashesJson, @payloadJson, @hash)`
       )
       .run({
         timestamp,
@@ -78,6 +86,7 @@ export class Ledger {
         aiTool: input.aiTool,
         originConfidence: input.originConfidence,
         fileHashesJson: JSON.stringify(input.fileHashes),
+        payloadJson: input.payload ? JSON.stringify(input.payload) : null,
         hash,
       });
 
@@ -104,6 +113,7 @@ export class Ledger {
       aiTool: r.ai_tool,
       originConfidence: r.origin_confidence,
       fileHashes: JSON.parse(r.file_hashes_json),
+      ...(r.payload_json ? { payload: JSON.parse(r.payload_json) } : {}),
       hash: r.hash,
     }));
   }
@@ -125,6 +135,7 @@ export class Ledger {
         aiTool: entry.aiTool,
         originConfidence: entry.originConfidence,
         fileHashes: entry.fileHashes,
+        payload: entry.payload,
       });
       if (recomputed !== entry.hash) {
         return { ok: false, brokenAtId: entry.id };

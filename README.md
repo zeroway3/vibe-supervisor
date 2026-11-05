@@ -6,13 +6,17 @@ AI 생성 코드에 대한 감독 계층. 탐지 정확도로 경쟁하지 않�
 ## 현재 범위
 
 **출처 추적 (1단계 — 커밋 트레일러 방식)**
-- 커밋 메시지의 `AI-Generated: <tool>[, ratio=<0~1>]` 트레일러를 파싱해 출처
-  신뢰도(confirmed/unknown)를 기록한다.
+- 출처 신뢰도는 3단계로 기록한다.
+  - 확정(confirmed): 개발자가 `AI-Generated: <tool>[, ratio=<0~1>]` 트레일러로 선언. ratio도 원장에 남는다.
+  - 추정(estimated): AI 도구가 붙이는 공동작성자 트레일러(`Co-Authored-By: Claude/Copilot/Cursor…`).
+  - 미상(unknown): 신호 없음. "AI 미사용"이 아니라 "모름"으로 표기한다.
 - 커밋마다 변경된 파일의 sha256 해시를 SQLite 기반 해시 체인(`.vibe-supervisor/ledger.db`)에
   추가한다. 중간 레코드를 고치면 그 이후 전체 체인이 깨져서 검출된다.
 - 코드 본문은 저장하지 않는다 — 파일 해시만 남긴다.
 
 **검사**
+- 커밋 시점에 바뀐 파일만 자동으로 증분 검사한다(post-commit 훅). 로컬 `semgrep`이 없으면
+  버전을 고정한 Docker 이미지(`semgrep/semgrep:1.95.0`)로 대신 돌린다. `VS_SKIP_SCAN=1`이면 건너뛴다.
 - `rulesets/ko-baseline-v1.yaml` 고정 룰셋(하드코딩 시크릿·SQL 문자열결합·eval/exec·약한 난수)으로
   Semgrep을 돌린다. `--config auto`(클라우드 레지스트리, 매번 바뀜) 대신 로컬 파일을 써서
   재현성을 지킨다 — 룰셋 파일 해시가 리포트에 그대로 찍힌다.
@@ -20,7 +24,15 @@ AI 생성 코드에 대한 감독 계층. 탐지 정확도로 경쟁하지 않�
   심사 근거로 바로 인용하지 못하게 한다(현직 심사원 검증 전까지는 추정값).
 
 **승인 플로우**
-- `approve <id>`로 발견사항을 승인/예외 처리하고, 그 행위 자체를 원장에 기록한다.
+- `approve <id>`로 발견사항을 **조치 완료(`--fixed`) / 승인(위험 수용) / 예외(`--exception`)** 중 하나로 처리하고,
+  그 행위 자체를 원장에 기록한다. 조치 완료는 조치 내용, 예외는 사유(`--note`)가 필수.
+- "고쳤다"와 "그대로 두기로 했다"를 구분한다. 조치 완료 항목은 원장의 재검사 기록(같은 파일을 다시 검사했는데
+  같은 규칙이 더는 안 나옴)이 있으면 리포트에 "재검사 확인: 커밋 …"으로, 없으면 "재검사 근거 없음"으로 표기한다.
+  커밋 시점 재검사에서 기존 미승인 항목이 사라지면 훅이 알려주지만, 상태를 자동으로 닫지는 않는다(판단은 사람이 기록).
+- 승인 대상(규칙·파일·라인)·결정·사유가 원장 레코드의 해시에 포함된다. 탐지 기록도 마찬가지로
+  "어떤 발견사항이 몇 번으로 저장됐는지"를 체인에 고정한다. 그래서 `findings.db`를 직접 고치면
+  (사유 수정, 원장 없이 승인, 항목 삭제·추가) `verify`의 "발견사항·승인 대조"에서 걸린다.
+  기존 원장(이 기능 이전 레코드)은 그대로 검증되고, 대조 근거가 없는 구버전 발견사항은 따로 센다.
 
 **증빙**
 - `report`로 실제 원장+발견사항 기반 리포트를 생성한다(기존엔 `demo.ts`의 가짜 데이터만 있었음).
@@ -34,12 +46,29 @@ AI 생성 코드에 대한 감독 계층. 탐지 정확도로 경쟁하지 않�
   같이 확인한다. 실제로 원장을 지우고 다른 내용으로 재생성하는 공격을 재현해봤더니
   "체인 무결성은 OK"가 뜨면서도(내부적으로는 일관된 새 체인이라) "앵커 불일치"로
   `verify`가 실패(exit 1)하는 걸 확인함 — 의도한 대로 동작.
+- `anchor`는 TSA 응답의 nonce·messageImprint·서명을 받는 즉시 검증하고, 통과한 토큰만 저장한다.
+- `verify`는 저장된 토큰의 TSA 서명을 다시 검증하고, 서명된 해시를 anchors.db의 값이 아니라 **지금 원장의
+  해당 레코드 해시**와 대조한다. 원장을 재계산하면서 anchors.db의 해시까지 맞춰 고치는 공격도 걸린다.
+  `--tsa-ca <루트인증서.pem>`을 주면 서명자 인증서 체인까지 확인한다(FreeTSA: https://freetsa.org/files/cacert.pem).
 - 리포트에도 앵커 상태가 별도 섹션으로 들어간다. 앵커가 없으면 "소급 재생성 여부를
   증명할 수 없음"이라고 솔직하게 표시한다.
 
+**리포트 구성**: 요약 → ISMS-P 2.8.1~2.8.6 대응 범위(커버/부분/대상 아님) → 발견사항별 탐지·처리 시각과
+출처 → 예외 내역 → 출처 분포 → 재현성 → 무결성 설명·앵커 검증 결과·알려진 한계 → 원장 부록.
+
+**시연·미팅 자료**
+- `bash demo/run-demo.sh`: 임시 Java/Spring 저장소에서 커밋 → 자동 검사 → 수정·승인·예외 → 앵커 →
+  리포트 → 변조 3종(사유 수정 / 원장 없이 승인 / 원장 재계산+앵커 해시 수정)을 시연하고 전부 검출되는 걸 보여준다.
+  `DEMO_OFFLINE=1`(TSA 생략), `DEMO_PAUSE=1`(단계별 정지), `DEMO_DIR=…`(작업 폴더) 옵션.
+- `docs/meeting-guide.md`: 보안담당자·심사원 미팅 질문지, 시연 순서, 남길 것, 예상 반론.
+
+**테스트**: `npm test` — 원장 payload 변조, 구버전 원장 호환, 발견사항 DB 변조·삭제·삽입, 트레일러 판정.
+
 아직 안 만든 것(다음 단계): IDE 확장 이벤트 캡처(조사해보니 Copilot은 외부 확장에 수락
 이벤트를 공식 API로 안 열어줘서 완전한 구현이 어려움 — 지금 있는 커밋 트레일러 방식이
-더 안정적인 1차 신호), 편집 패턴 분석, 앵커 자동 스케줄링(지금은 수동 `anchor` 호출).
+더 안정적인 1차 신호), 편집 패턴 분석, 앵커 자동 스케줄링(지금은 수동 `anchor` 호출),
+승인자 신원 강화(지금은 git 이메일 — 서명 커밋/SSO), 전체 검사(`scan --all`)도 재검사 근거로 쓸 수 있게 대상 파일 목록 기록,
+외부 도구 SARIF 가져오기.
 
 ## 빠른 시작
 
@@ -64,10 +93,14 @@ node /path/to/vibe-supervisor/dist/cli/index.js verify
 node /path/to/vibe-supervisor/dist/cli/index.js scan
 
 # 발견사항 승인 (scan 출력에 찍히는 번호로)
-node /path/to/vibe-supervisor/dist/cli/index.js approve 1 --note "환경변수로 이관 완료"
+node /path/to/vibe-supervisor/dist/cli/index.js approve 1 --fixed --note "환경변수로 이관"
+node /path/to/vibe-supervisor/dist/cli/index.js approve 2 --exception --note "내부 배치 전용 — 다음 분기 재검토"
 
 # 실제 원장+발견사항으로 리포트 생성
 node /path/to/vibe-supervisor/dist/cli/index.js report
+
+# 인쇄·제출용 HTML (브라우저에서 열고 '인쇄 / PDF로 저장' → PDF. 발견사항 표는 가로 페이지)
+node /path/to/vibe-supervisor/dist/cli/index.js report -o report.html
 
 # 원장 끝 해시를 외부 TSA에 등록 (소급 재생성 방지)
 node /path/to/vibe-supervisor/dist/cli/index.js anchor

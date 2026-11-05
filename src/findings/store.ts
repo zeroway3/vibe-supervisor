@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import type { Finding } from "../report/types.js";
+import type { Finding, FindingDecision } from "../report/types.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS findings (
@@ -37,19 +37,22 @@ export class FindingsStore {
     this.db.exec(SCHEMA);
   }
 
-  saveAll(commitHash: string, findings: Finding[]): void {
+  /** 저장된 id를 입력 순서대로 돌려준다 — 원장의 detected 레코드가 이 id를 고정한다. */
+  saveAll(commitHash: string, findings: Finding[]): number[] {
     const scanTimestamp = new Date().toISOString();
     const insert = this.db.prepare(
       `INSERT INTO findings
        (scan_timestamp, commit_hash, rule_id, severity, file, line, message, ismsp_clause, status)
        VALUES (@scanTimestamp, @commitHash, @ruleId, @severity, @file, @line, @message, @ismspClause, 'open')`
     );
-    const tx = this.db.transaction((rows: Finding[]) => {
-      for (const f of rows) {
-        insert.run({ scanTimestamp, commitHash, ...f });
-      }
-    });
-    tx(findings);
+    const tx = this.db.transaction((rows: Finding[]) =>
+      rows.map((f) => Number(insert.run({ scanTimestamp, commitHash, ...f }).lastInsertRowid))
+    );
+    return tx(findings);
+  }
+
+  get(id: number): StoredFinding | undefined {
+    return this.all().find((f) => f.id === id);
   }
 
   all(): StoredFinding[] {
@@ -70,7 +73,7 @@ export class FindingsStore {
     }));
   }
 
-  approve(id: number, status: "approved" | "exception", approvedBy: string, note?: string): boolean {
+  approve(id: number, status: FindingDecision, approvedBy: string, note?: string): boolean {
     const result = this.db
       .prepare(
         "UPDATE findings SET status = @status, approved_by = @approvedBy, approval_note = @note WHERE id = @id"

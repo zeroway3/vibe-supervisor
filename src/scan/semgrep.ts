@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { mapToIsmspClause } from "./isms-mapping.js";
 import type { Finding, FindingSeverity, RulesetInfo } from "../report/types.js";
 
@@ -42,6 +42,28 @@ function mapSeverity(level: string | undefined): FindingSeverity {
   return "medium";
 }
 
+/** 로컬 semgrep이 없을 때 쓰는 이미지. 엔진 버전도 결과에 영향을 주므로
+ * latest가 아니라 버전을 고정한다(재현성). */
+export const SEMGREP_DOCKER_IMAGE = "semgrep/semgrep:1.95.0";
+
+function commandWorks(cmd: string, args: string[]): boolean {
+  try {
+    execFileSync(cmd, args, { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 로컬 semgrep을 우선 쓰고, 없으면 Docker 이미지로 대신한다(Windows는 semgrep
+ * 네이티브 지원이 약해서 Docker 경로가 현실적인 대안이다). VS_SEMGREP=docker로
+ * Docker를 강제할 수 있다. */
+export function resolveSemgrepRunner(): { kind: "local" | "docker" } | null {
+  if (process.env.VS_SEMGREP !== "docker" && commandWorks("semgrep", ["--version"])) return { kind: "local" };
+  if (commandWorks("docker", ["image", "inspect", SEMGREP_DOCKER_IMAGE])) return { kind: "docker" };
+  return null;
+}
+
 export function runSemgrepScan(
   repoRoot: string,
   rulesetPath: string,
@@ -54,13 +76,34 @@ export function runSemgrepScan(
   const tmpDir = mkdtempSync(join(tmpdir(), "vs-scan-"));
   const sarifPath = join(tmpDir, "out.sarif");
 
+  const runner = resolveSemgrepRunner();
+  if (!runner) throw new Error("semgrep을 찾을 수 없습니다 — 'pip install semgrep' 또는 Docker를 설치하세요.");
+
   try {
-    const args = ["--config", rulesetPath, "--sarif", "--output", sarifPath, "--quiet"];
     // targetFiles가 있으면 그 파일들만(증분 스캔) — 없으면 저장소 전체.
-    args.push(...(targetFiles && targetFiles.length > 0 ? targetFiles : ["."]));
+    const targets = targetFiles && targetFiles.length > 0 ? targetFiles : ["."];
+    const { cmd, args } =
+      runner.kind === "local"
+        ? { cmd: "semgrep", args: ["--config", rulesetPath, "--sarif", "--output", sarifPath, "--quiet", ...targets] }
+        : {
+            // 저장소·룰셋·출력 폴더를 각각 마운트한다. 경로가 컨테이너 기준으로
+            // 바뀌므로 SARIF의 파일 경로는 /src 기준 상대경로로 나온다.
+            cmd: "docker",
+            args: [
+              "run", "--rm",
+              "-v", `${repoRoot}:/src`,
+              "-v", `${dirname(rulesetPath)}:/rules:ro`,
+              "-v", `${tmpDir}:/out`,
+              "-w", "/src",
+              SEMGREP_DOCKER_IMAGE,
+              "semgrep", "--config", `/rules/${basename(rulesetPath)}`,
+              "--sarif", "--output", "/out/out.sarif", "--quiet", "--metrics=off",
+              ...targets.map((t) => t.replace(/\\/g, "/")),
+            ],
+          };
 
     try {
-      execFileSync("semgrep", args, { cwd: repoRoot, stdio: ["ignore", "ignore", "pipe"] });
+      execFileSync(cmd, args, { cwd: repoRoot, stdio: ["ignore", "ignore", "pipe"] });
     } catch (err: any) {
       // semgrep은 finding이 있으면(blocking rule) 0이 아닌 exit code를 낼 수 있다 —
       // 이건 에러가 아니라 정상적인 "찾았다"는 신호다. sarif 파일이 실제로

@@ -50,8 +50,8 @@ const findings: Finding[] = [
     file: "src/payment/PaymentService.java",
     line: 42,
     message: "결제 API 키가 소스코드에 하드코딩되어 있습니다.",
-    ismspClause: "2.8.4 (암호화 적용) [확인 필요]",
-    status: "approved",
+    ismspClause: "2.7.2 암호키 관리 [확인 필요]",
+    status: "fixed",
     approvedBy: "김보안",
     approvalNote: "환경변수로 이관 완료, PR #214 반영",
   },
@@ -61,7 +61,7 @@ const findings: Finding[] = [
     file: "src/order/OrderRepository.java",
     line: 118,
     message: "문자열 결합으로 생성된 쿼리에서 SQL 인젝션 가능성이 있습니다.",
-    ismspClause: "2.8.1 (보안 요구사항 정의) [확인 필요]",
+    ismspClause: "2.8.2 보안 요구사항 검토 및 시험(시큐어코딩 점검) [확인 필요]",
     status: "exception",
     approvedBy: "박개발",
     approvalNote: "내부망 전용 배치 작업, 외부 입력 경로 없음 — 다음 분기 재검토 예정",
@@ -72,7 +72,7 @@ const findings: Finding[] = [
     file: "src/auth/SessionManager.java",
     line: 77,
     message: "세션 토큰 생성에 암호학적으로 안전하지 않은 난수 생성기를 사용합니다.",
-    ismspClause: "2.8.4 (암호화 적용) [확인 필요]",
+    ismspClause: "2.7.1 암호정책 적용 [확인 필요]",
     status: "open",
   },
 ];
@@ -86,8 +86,13 @@ const report = generateReport(
     findings,
     isSample: true,
   },
-  entries,
-  integrity
+  {
+    entries,
+    integrity,
+    // 샘플은 발견사항을 원장에 실제로 기록하지 않으므로 대조는 통과로 둔다.
+    crossCheck: { issues: [], verified: findings.length, unverifiable: 0 },
+    anchorChecks: [],
+  }
 );
 
 const outPath = join(process.cwd(), "sample-report.md");

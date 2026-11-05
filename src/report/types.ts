@@ -1,6 +1,17 @@
 export type FindingSeverity = "critical" | "high" | "medium" | "low";
 
-export type FindingStatus = "approved" | "exception" | "open";
+/** approved = 위험을 확인하고 받아들임, fixed = 코드를 고쳐 해소함, exception = 사유를 남기고 예외.
+ * approved와 fixed를 나누는 이유: 리포트에서 "고쳤다"와 "그대로 두기로 했다"가 같은 "승인"으로
+ * 보이면 심사원이 조치 여부를 판단할 수 없다. */
+export type FindingStatus = "approved" | "fixed" | "exception" | "open";
+
+export type FindingDecision = Exclude<FindingStatus, "open">;
+
+export const DECISION_LABEL: Record<FindingDecision, string> = {
+  approved: "승인",
+  fixed: "조치 완료",
+  exception: "예외 처리",
+};
 
 export interface Finding {
   ruleId: string;
