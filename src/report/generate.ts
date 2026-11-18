@@ -2,6 +2,7 @@ import type { LedgerEntry } from "../ledger/types.js";
 import type { CrossCheckIssue } from "../ledger/crosscheck.js";
 import type { AnchorCheck } from "../timestamp/check.js";
 import { rescanEvidence, type RescanEvidence } from "../ledger/rescan.js";
+import type { CompletenessResult } from "../ledger/completeness.js";
 import { DECISION_LABEL, type ReportInput, type Finding } from "./types.js";
 
 /** 리포트에 필요한 검증 결과. CLI는 audit.ts의 AuditResult를 그대로 넘기고,
@@ -11,6 +12,63 @@ export interface ReportAudit {
   integrity: { ok: boolean; brokenAtId: number | null };
   crossCheck: { issues: CrossCheckIssue[]; verified: number; unverifiable: number };
   anchorChecks: AnchorCheck[];
+  /** git 이력 대비 기록 누락 검사 결과. 샘플 리포트처럼 git 이력이 없으면 생략한다. */
+  completeness?: CompletenessResult;
+}
+
+/** 기록 완전성 요약 — 표의 한 줄 라벨과 6장 상세. */
+function completenessSummary(c: CompletenessResult | undefined): { label: string; detail: string } {
+  if (!c) return { label: "— (확인하지 않음)", detail: "_이 리포트는 git 이력과의 대조 없이 생성되었습니다._" };
+  if (c.baseline === null) {
+    return {
+      label: "⚠ 확인 범위 없음",
+      detail: "현재 브랜치 이력에 원장에 기록된 커밋이 없어 기록 누락 여부를 확인할 수 없습니다.",
+    };
+  }
+  const base = `기준 커밋 \`${c.baseline.slice(0, 8)}\`(원장에 기록된 가장 오래된 커밋) 이후 일반 커밋 ${c.checked}건을 git 이력과 대조했습니다.`;
+  const label =
+    c.missing.length === 0
+      ? `✅ 커밋 ${c.checked}건 모두 기록됨${c.scanGaps.length > 0 ? ` (검사 기록 없는 커밋 ${c.scanGaps.length}건)` : ""}`
+      : `❌ 기록 누락 커밋 ${c.missing.length}건 / ${c.checked}건`;
+
+  const parts = [base];
+  if (c.missing.length > 0) {
+    parts.push(
+      `\n**❌ 원장에 기록되지 않은 커밋 ${c.missing.length}건** — 훅이 설치되지 않은 곳에서 만들었거나 훅을 우회한 커밋입니다. ` +
+        `이 커밋들은 출처 기록과 커밋 시점 보안 검사가 없습니다.\n\n| 커밋 | 작성일 | 작성자 | 제목 |\n|---|---|---|---|\n` +
+        c.missing
+          .slice(0, 50)
+          .map((m) => `| \`${m.hash.slice(0, 8)}\` | ${m.date.slice(0, 10)} | ${cell(m.author)} | ${cell(m.subject)} |`)
+          .join("\n") +
+        (c.missing.length > 50 ? `\n\n… 외 ${c.missing.length - 50}건` : "")
+    );
+  }
+  if (c.scanGaps.length > 0) {
+    parts.push(
+      `\n**⚠ 보안 검사 기록이 없는 커밋 ${c.scanGaps.length}건** — 커밋은 기록됐지만 바뀐 파일이 이후 어떤 검사에도 포함되지 않았습니다 ` +
+        `(검사를 건너뛰었거나 검사 도구가 없었던 경우).\n\n` +
+        c.scanGaps
+          .slice(0, 30)
+          .map((g) => `- \`${g.commitHash.slice(0, 8)}\`: ${g.files.slice(0, 5).map(cell).join(", ")}${g.files.length > 5 ? ` 외 ${g.files.length - 5}개` : ""}`)
+          .join("\n")
+    );
+  }
+  if (c.lateScanned > 0) {
+    parts.push(`\n- 커밋 시점이 아니라 이후 검사로만 확인된 커밋: ${c.lateScanned}건`);
+  }
+  if (c.unrecordedMerges.length > 0) {
+    parts.push(
+      `\n- 기록이 없는 병합 커밋: ${c.unrecordedMerges.length}건 — git merge는 커밋 훅을 실행하지 않아 누락으로 보지 않았습니다. ` +
+        `병합 과정에서 코드가 바뀌지 않았는지는 별도 확인이 필요합니다.`
+    );
+  }
+  if (c.orphaned.length > 0) {
+    parts.push(
+      `\n- 원장에는 있지만 현재 이력에 없는 커밋: ${c.orphaned.length}건 — amend·rebase·reset으로 이력이 바뀐 경우입니다. ` +
+        `기록 이후 이력이 바뀌었다는 사실을 숨기지 않고 표기합니다.`
+    );
+  }
+  return { label, detail: parts.join("\n") };
 }
 
 type ReportFinding = Finding & { id?: number; commitHash?: string };
@@ -198,6 +256,7 @@ export function generateReport(input: ReportInput, audit: ReportAudit): string {
     return c && c.originConfidence !== "unknown";
   });
   const anchors = anchorSummary(audit.anchorChecks);
+  const completeness = completenessSummary(audit.completeness);
   const cc = audit.crossCheck;
   const scans = audit.entries.filter((e) => e.eventType === "detected").length;
   const approvals = audit.entries.filter((e) => e.payload?.kind === "approved").length;
@@ -228,6 +287,7 @@ ${warningBlock}
 | 원장 무결성 (해시 체인) | ${audit.integrity.ok ? "✅ 정상 (변조 흔적 없음)" : `❌ 깨짐 — id=${audit.integrity.brokenAtId} 이후`} |
 | 발견사항·승인 기록 대조 | ${ccLabel} |
 | 외부 타임스탬프 앵커 | ${anchors.label} |
+| 기록 완전성 (git 이력 대조) | ${completeness.label} |
 
 ## 요약
 
@@ -323,10 +383,16 @@ ${sourcesUsed.map((s) => `| \`${s.version}\` | \`${s.hash.slice(0, 16)}…\` |`)
    검증 시 그 서명과 지금 원장의 해시를 대조합니다.
 3. **코드 본문 미저장**: 원장에는 파일 해시와 메타데이터만 있고 소스코드는 없습니다.
    코드 외부 반출 금지 정책을 지키면서 원장을 그대로 제출할 수 있습니다.
+4. **기록 완전성**: 1·2는 "있는 기록을 고치지 않았다"만 보장합니다. 커밋 훅을 거치지
+   않은 커밋은 애초에 기록이 없으므로, git 이력과 원장을 대조해 빠진 커밋을 따로 찾습니다.
 
 ### 외부 타임스탬프 앵커 검증 결과
 
 ${anchors.detail}
+
+### 기록 완전성 검사 결과
+
+${completeness.detail}
 
 ### 알려진 한계
 
@@ -334,6 +400,9 @@ ${anchors.detail}
   처리(approve) 행위 자체**는 여전히 git 설정의 이메일만 믿습니다. SSO 연동
   전까지는 "누가 처리했는가"가 승인 단계에서는 자기신고에 가깝습니다.
 - 앵커와 앵커 사이 구간은 다음 앵커 전까지 외부 보증이 없습니다. 앵커 주기가 곧 보증 간격입니다.
+- 기록 완전성은 이 리포트를 생성한 저장소 사본의 git 이력 기준입니다. 원장은 저장소
+  사본마다 따로 쌓이므로, 다른 개발자의 PC에서 만든 커밋은 그 사본의 원장에 기록됩니다
+  (팀 단위 원장 통합은 다음 단계).
 
 ## 부록. 감독 원장 상세
 

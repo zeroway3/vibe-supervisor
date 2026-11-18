@@ -16,6 +16,7 @@ import { requestTimestamp, KNOWN_TSA_URLS } from "../timestamp/rfc3161.js";
 import { runAudit } from "../audit.js";
 import { DECISION_LABEL, type FindingDecision } from "../report/types.js";
 import { loadConfig, saveConfig } from "../config/store.js";
+import type { CompletenessResult } from "../ledger/completeness.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const HOOK_SCRIPT = join(__dirname, "..", "hooks", "post-commit.js");
@@ -49,6 +50,53 @@ function readTrustedPem(path: string | undefined): string | undefined {
   return readFileSync(path, "utf-8");
 }
 
+const short = (h: string) => h.slice(0, 8);
+
+function printCompleteness(c: CompletenessResult) {
+  if (c.baseline === null) {
+    console.log("[4/4] (참고) 현재 브랜치 이력에 원장에 기록된 커밋이 없어 기록 누락을 확인할 범위가 없습니다.");
+  } else if (c.missing.length === 0) {
+    console.log(
+      `[4/4] 기록 완전성 OK — 기준 커밋 ${short(c.baseline)} 이후 일반 커밋 ${c.checked}건이 모두 원장에 기록됨.`
+    );
+  } else {
+    console.error(
+      `[4/4] 원장에 기록되지 않은 커밋 ${c.missing.length}건 (기준 ${short(c.baseline)} 이후 ${c.checked}건 중) — ` +
+        `훅이 없는 곳에서 만들었거나 훅을 우회한 커밋입니다:`
+    );
+    for (const m of c.missing.slice(0, 20)) {
+      console.error(`  - ${short(m.hash)}  ${m.date.slice(0, 10)}  ${m.author}  ${m.subject}`);
+    }
+    if (c.missing.length > 20) console.error(`  … 외 ${c.missing.length - 20}건`);
+  }
+
+  // 아래는 실패가 아니라 확인이 필요한 경고 — verify 결과(exit code)에는 반영하지 않는다.
+  if (c.unrecordedMerges.length > 0) {
+    console.log(
+      `      ⚠ 기록이 없는 병합 커밋 ${c.unrecordedMerges.length}건 — git merge는 post-commit 훅을 실행하지 않습니다. ` +
+        `병합 과정에서 코드가 바뀌지 않았는지 확인이 필요합니다.`
+    );
+  }
+  if (c.scanGaps.length > 0) {
+    console.log(
+      `      ⚠ 보안 검사 기록이 없는 커밋 ${c.scanGaps.length}건 (VS_SKIP_SCAN=1, semgrep 미설치, 검사 실패 등) — ` +
+        `'vibe-supervisor scan --all'로 보완하면 "이후 검사"로 표시됩니다.`
+    );
+    for (const g of c.scanGaps.slice(0, 10)) {
+      console.log(`        ${short(g.commitHash)}: ${g.files.slice(0, 3).join(", ")}${g.files.length > 3 ? ` 외 ${g.files.length - 3}개` : ""}`);
+    }
+  }
+  if (c.lateScanned > 0) {
+    console.log(`      (참고) 커밋 시점이 아니라 이후 검사로만 확인된 커밋 ${c.lateScanned}건`);
+  }
+  if (c.orphaned.length > 0) {
+    console.log(
+      `      (참고) 원장에는 있지만 현재 이력에 없는 커밋 ${c.orphaned.length}건 — amend·rebase·reset으로 이력이 바뀐 경우입니다. ` +
+        `정상 작업일 수 있지만, 기록 이후 이력이 바뀌었다는 사실은 그대로 남습니다.`
+    );
+  }
+}
+
 const program = new Command();
 program.name("vibe-supervisor").description(
   "AI 생성 코드에 대한 감독 계층 — git 훅으로 변조 불가능한 감독 원장을 남긴다"
@@ -80,29 +128,30 @@ program
 
 program
   .command("verify")
-  .description("원장 해시 체인 + 발견사항·승인 대조 + 외부 타임스탬프 서명까지 검증한다")
+  .description("원장 해시 체인 + 발견사항·승인 대조 + 외부 타임스탬프 서명 + git 이력 대비 기록 누락까지 검증한다")
   .option("--tsa-ca <pem>", "TSA 신뢰 루트 인증서(PEM). 주면 서명자 인증서 체인까지 확인한다")
+  .option("--since <commit>", "완전성 검사 기준 커밋(포함). 생략하면 원장에 기록된 가장 오래된 커밋부터 본다")
   .action(async (opts) => {
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
     requireLedger(repoRoot);
-    const audit = await runAudit(repoRoot, readTrustedPem(opts.tsaCa));
+    const audit = await runAudit(repoRoot, readTrustedPem(opts.tsaCa), opts.since);
 
     // 1) 해시 체인
     if (audit.integrity.ok) {
-      console.log(`[1/3] 체인 무결성 OK — 원장 ${audit.entries.length}건, 변조 흔적 없음.`);
+      console.log(`[1/4] 체인 무결성 OK — 원장 ${audit.entries.length}건, 변조 흔적 없음.`);
     } else {
-      console.error(`[1/3] 체인 깨짐 — id=${audit.integrity.brokenAtId} 이후 기록이 원래 해시와 안 맞습니다.`);
+      console.error(`[1/4] 체인 깨짐 — id=${audit.integrity.brokenAtId} 이후 기록이 원래 해시와 안 맞습니다.`);
     }
 
     // 2) findings.db는 체인 밖이라, 체인에 고정된 탐지·승인 기록과 대조한다.
     const cc = audit.crossCheck;
     if (cc.issues.length === 0) {
       console.log(
-        `[2/3] 발견사항·승인 대조 OK — ${cc.verified}건 원장과 일치` +
+        `[2/4] 발견사항·승인 대조 OK — ${cc.verified}건 원장과 일치` +
           `${cc.unverifiable > 0 ? ` (구버전 기록 ${cc.unverifiable}건은 대조 근거 없음)` : ""}.`
       );
     } else {
-      console.error(`[2/3] 발견사항·승인 기록 불일치 ${cc.issues.length}건:`);
+      console.error(`[2/4] 발견사항·승인 기록 불일치 ${cc.issues.length}건:`);
       for (const i of cc.issues) console.error(`  - 발견사항 #${i.findingId}: ${i.message}`);
     }
 
@@ -111,12 +160,12 @@ program
     // 짚은 구멍) 체인은 내부적으로 일관돼도 여기서 걸린다. anchors.db까지
     // 같이 고쳐도 TSA 서명은 다시 만들 수 없어서 걸린다.
     if (audit.anchorChecks.length === 0) {
-      console.log("[3/3] (참고) 외부 타임스탬프 앵커가 아직 없습니다 — 'vibe-supervisor anchor'로 추가할 수 있습니다.");
+      console.log("[3/4] (참고) 외부 타임스탬프 앵커가 아직 없습니다 — 'vibe-supervisor anchor'로 추가할 수 있습니다.");
     } else {
       for (const a of audit.anchorChecks) {
         if (a.token.ok) continue;
         console.error(
-          `[3/3] 앵커 #${a.anchor.id} 실패 — 원장 #${a.anchor.ledgerEntryId}: ${a.token.message} ` +
+          `[3/4] 앵커 #${a.anchor.id} 실패 — 원장 #${a.anchor.ledgerEntryId}: ${a.token.message} ` +
             `이 시점 이전 기록이 나중에 다시 생성됐거나 앵커가 조작됐을 가능성이 있습니다.`
         );
       }
@@ -124,7 +173,7 @@ program
       if (passed.length === audit.anchorChecks.length) {
         const latest = passed[passed.length - 1].token;
         console.log(
-          `[3/3] 외부 타임스탬프 앵커 ${passed.length}건 서명·해시 모두 일치 — ` +
+          `[3/4] 외부 타임스탬프 앵커 ${passed.length}건 서명·해시 모두 일치 — ` +
             `가장 최근 앵커(${latest.genTime}, 서명자 ${latest.signer}) 시점까지는 소급 재생성되지 않았음을 확인.`
         );
         if (!latest.chainChecked) {
@@ -132,6 +181,10 @@ program
         }
       }
     }
+
+    // 4) 완전성: 체인은 "있는 기록을 고치지 않았다"만 보장한다. 훅을 거치지 않은
+    // 커밋은 애초에 기록이 없으므로, git 이력과 대조해 빠진 커밋을 찾는다.
+    printCompleteness(audit.completeness);
 
     if (!audit.ok) process.exit(1);
   });
@@ -406,10 +459,11 @@ program
     "vibe-supervisor-report.md"
   )
   .option("--tsa-ca <pem>", "TSA 신뢰 루트 인증서(PEM). 주면 앵커 검증에 인증서 체인까지 포함한다")
+  .option("--since <commit>", "기록 완전성 검사 기준 커밋(포함). 생략하면 원장에 기록된 가장 오래된 커밋부터 본다")
   .action(async (opts) => {
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
     requireLedger(repoRoot);
-    const audit = await runAudit(repoRoot, readTrustedPem(opts.tsaCa));
+    const audit = await runAudit(repoRoot, readTrustedPem(opts.tsaCa), opts.since);
 
     const repoName = (() => {
       try {
