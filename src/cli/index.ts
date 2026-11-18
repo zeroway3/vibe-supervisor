@@ -14,6 +14,7 @@ import { renderReportHtml } from "../report/html.js";
 import { AnchorStore } from "../timestamp/store.js";
 import { requestTimestamp, KNOWN_TSA_URLS } from "../timestamp/rfc3161.js";
 import { runAudit } from "../audit.js";
+import { resolveAllowedSigners, resolveSigningKey, signApproval, type ApprovalSignature } from "../signing/approval.js";
 import { DECISION_LABEL, type FindingDecision } from "../report/types.js";
 import { loadConfig, saveConfig } from "../config/store.js";
 
@@ -80,29 +81,37 @@ program
 
 program
   .command("verify")
-  .description("원장 해시 체인 + 발견사항·승인 대조 + 외부 타임스탬프 서명까지 검증한다")
+  .description("원장 해시 체인 + 발견사항·승인 대조 + 외부 타임스탬프 + 승인 서명까지 검증한다")
   .option("--tsa-ca <pem>", "TSA 신뢰 루트 인증서(PEM). 주면 서명자 인증서 체인까지 확인한다")
+  .option(
+    "--allowed-signers <file>",
+    "승인자 SSH 키 목록(ssh-keygen ALLOWED SIGNERS 형식). 없으면 git config gpg.ssh.allowedSignersFile을 쓴다"
+  )
   .action(async (opts) => {
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
     requireLedger(repoRoot);
-    const audit = await runAudit(repoRoot, readTrustedPem(opts.tsaCa));
+    const audit = await runAudit(
+      repoRoot,
+      readTrustedPem(opts.tsaCa),
+      resolveAllowedSigners(repoRoot, opts.allowedSigners)
+    );
 
     // 1) 해시 체인
     if (audit.integrity.ok) {
-      console.log(`[1/3] 체인 무결성 OK — 원장 ${audit.entries.length}건, 변조 흔적 없음.`);
+      console.log(`[1/4] 체인 무결성 OK — 원장 ${audit.entries.length}건, 변조 흔적 없음.`);
     } else {
-      console.error(`[1/3] 체인 깨짐 — id=${audit.integrity.brokenAtId} 이후 기록이 원래 해시와 안 맞습니다.`);
+      console.error(`[1/4] 체인 깨짐 — id=${audit.integrity.brokenAtId} 이후 기록이 원래 해시와 안 맞습니다.`);
     }
 
     // 2) findings.db는 체인 밖이라, 체인에 고정된 탐지·승인 기록과 대조한다.
     const cc = audit.crossCheck;
     if (cc.issues.length === 0) {
       console.log(
-        `[2/3] 발견사항·승인 대조 OK — ${cc.verified}건 원장과 일치` +
+        `[2/4] 발견사항·승인 대조 OK — ${cc.verified}건 원장과 일치` +
           `${cc.unverifiable > 0 ? ` (구버전 기록 ${cc.unverifiable}건은 대조 근거 없음)` : ""}.`
       );
     } else {
-      console.error(`[2/3] 발견사항·승인 기록 불일치 ${cc.issues.length}건:`);
+      console.error(`[2/4] 발견사항·승인 기록 불일치 ${cc.issues.length}건:`);
       for (const i of cc.issues) console.error(`  - 발견사항 #${i.findingId}: ${i.message}`);
     }
 
@@ -111,12 +120,12 @@ program
     // 짚은 구멍) 체인은 내부적으로 일관돼도 여기서 걸린다. anchors.db까지
     // 같이 고쳐도 TSA 서명은 다시 만들 수 없어서 걸린다.
     if (audit.anchorChecks.length === 0) {
-      console.log("[3/3] (참고) 외부 타임스탬프 앵커가 아직 없습니다 — 'vibe-supervisor anchor'로 추가할 수 있습니다.");
+      console.log("[3/4] (참고) 외부 타임스탬프 앵커가 아직 없습니다 — 'vibe-supervisor anchor'로 추가할 수 있습니다.");
     } else {
       for (const a of audit.anchorChecks) {
         if (a.token.ok) continue;
         console.error(
-          `[3/3] 앵커 #${a.anchor.id} 실패 — 원장 #${a.anchor.ledgerEntryId}: ${a.token.message} ` +
+          `[3/4] 앵커 #${a.anchor.id} 실패 — 원장 #${a.anchor.ledgerEntryId}: ${a.token.message} ` +
             `이 시점 이전 기록이 나중에 다시 생성됐거나 앵커가 조작됐을 가능성이 있습니다.`
         );
       }
@@ -124,12 +133,32 @@ program
       if (passed.length === audit.anchorChecks.length) {
         const latest = passed[passed.length - 1].token;
         console.log(
-          `[3/3] 외부 타임스탬프 앵커 ${passed.length}건 서명·해시 모두 일치 — ` +
+          `[3/4] 외부 타임스탬프 앵커 ${passed.length}건 서명·해시 모두 일치 — ` +
             `가장 최근 앵커(${latest.genTime}, 서명자 ${latest.signer}) 시점까지는 소급 재생성되지 않았음을 확인.`
         );
         if (!latest.chainChecked) {
           console.log("      (참고) TSA 인증서 체인은 확인하지 않았습니다 — '--tsa-ca <루트인증서.pem>'으로 확인할 수 있습니다.");
         }
+      }
+    }
+
+    // 4) 승인 서명: 체인은 "기록이 안 바뀌었다"까지만 보장한다. 서명은 "그 기록을
+    // actor의 키 소유자가 만들었다"를 보탠다. 서명 없는 승인은 실패가 아니라 비율로 알린다.
+    const sigs = audit.approvalSignatures;
+    if (sigs.total === 0) {
+      console.log("[4/4] (참고) 승인 기록이 아직 없습니다.");
+    } else {
+      for (const f of sigs.failed) {
+        console.error(`[4/4] 승인 서명 실패 — 원장 #${f.entryId} (발견사항 #${f.findingId}, ${f.actor}): ${f.check!.message}`);
+      }
+      if (sigs.failed.length === 0) {
+        const trust = sigs.allowedSignersUsed
+          ? `그중 ${sigs.trusted}건은 허용 서명자 목록의 본인 키로 확인`
+          : "키 소유자 확인은 안 함 — '--allowed-signers <파일>'로 확인할 수 있습니다";
+        console.log(
+          `[4/4] 승인 서명 — ${sigs.total}건 중 ${sigs.good}건 서명 유효 (${trust})` +
+            `${sigs.unsigned > 0 ? `, ${sigs.unsigned}건은 서명 없이 기록됨(이메일 자기신고)` : ""}.`
+        );
       }
     }
 
@@ -343,6 +372,10 @@ program
   .option("--fixed", "코드를 고쳐 해소했다고 기록한다 (무엇을 고쳤는지 --note로 반드시 남길 것)")
   .option("--exception", "고치지 않고 예외로 둔다고 기록한다 (사유를 --note로 반드시 남길 것)")
   .option("--note <text>", "조치 내용 / 승인·예외 사유")
+  .option(
+    "--sign-key <path>",
+    "이 SSH 키로 승인 행위에 서명한다. 생략하면 git의 커밋 서명 설정(gpg.format=ssh, user.signingkey)을 따른다"
+  )
   .action((findingIdArg, opts) => {
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
     const findingId = Number(findingIdArg);
@@ -368,13 +401,41 @@ program
       process.exit(1);
     }
     const actor = git(["config", "user.email"], repoRoot) || "unknown";
+    const commitHash = git(["rev-parse", "HEAD"], repoRoot);
+
+    // 서명 키가 설정돼 있으면 서명한다. 실패하면 승인 자체를 멈춘다 — 서명하려던
+    // 승인이 조용히 미서명으로 남으면 "서명된 줄 알았다"가 된다.
+    const signingKey = resolveSigningKey(repoRoot, opts.signKey);
+    let signature: ApprovalSignature | undefined;
+    if (signingKey) {
+      try {
+        signature = signApproval(signingKey, {
+          findingId,
+          decision: status,
+          note,
+          ruleId: target.ruleId,
+          file: target.file,
+          line: target.line,
+          actor,
+          commitHash,
+        });
+      } catch (e) {
+        findingsStore.close();
+        const err = e as { stderr?: string; message?: string };
+        console.error(
+          `승인 서명에 실패해 기록하지 않았습니다 (키: ${signingKey}): ${(err.stderr || err.message || "").trim()}\n` +
+            "ssh-agent에 키가 있는지, 경로가 맞는지 확인하세요."
+        );
+        process.exit(1);
+      }
+    }
 
     // 원장에 먼저 남기고 DB를 바꾼다 — 반대 순서면 DB만 바뀌고 원장 기록이
     // 빠지는 경우가 생겨, verify가 그걸 "DB 직접 수정"으로 오인한다.
     const ledger = new Ledger(join(vsDir(repoRoot), "ledger.db"));
     ledger.append({
       eventType: status === "fixed" ? "fixed" : "approved",
-      commitHash: git(["rev-parse", "HEAD"], repoRoot),
+      commitHash,
       actor,
       aiTool: null,
       originConfidence: "confirmed",
@@ -387,6 +448,7 @@ program
         ruleId: target.ruleId,
         file: target.file,
         line: target.line,
+        ...(signature ? { signature } : {}),
       },
     });
     ledger.close();
@@ -394,7 +456,10 @@ program
     findingsStore.approve(findingId, status, actor, note ?? undefined);
     findingsStore.close();
 
-    console.log(`[vibe-supervisor] 발견사항 #${findingIdArg} — ${DECISION_LABEL[status]} 기록 완료 (${actor})`);
+    console.log(
+      `[vibe-supervisor] 발견사항 #${findingIdArg} — ${DECISION_LABEL[status]} 기록 완료 (${actor}` +
+        `${signature ? `, SSH 서명 ${signature.fingerprint}` : ", 서명 없음"})`
+    );
   });
 
 program
@@ -406,10 +471,15 @@ program
     "vibe-supervisor-report.md"
   )
   .option("--tsa-ca <pem>", "TSA 신뢰 루트 인증서(PEM). 주면 앵커 검증에 인증서 체인까지 포함한다")
+  .option("--allowed-signers <file>", "승인자 SSH 키 목록. 주면 승인 서명이 본인 키인지까지 확인해 표기한다")
   .action(async (opts) => {
     const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
     requireLedger(repoRoot);
-    const audit = await runAudit(repoRoot, readTrustedPem(opts.tsaCa));
+    const audit = await runAudit(
+      repoRoot,
+      readTrustedPem(opts.tsaCa),
+      resolveAllowedSigners(repoRoot, opts.allowedSigners)
+    );
 
     const repoName = (() => {
       try {

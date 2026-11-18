@@ -73,6 +73,15 @@ export function crossCheckFindings(
         });
         continue;
       }
+      // 상태는 그대로 두고 처리자·사유만 채워 넣는 경우 — 리포트에 "처리자"가
+      // 찍혀 누군가 검토한 것처럼 보이게 된다. (변조 속성 테스트가 찾은 경로)
+      if (f.approvedBy !== undefined || f.approvalNote !== undefined) {
+        issues.push({
+          findingId: f.id,
+          message: `원장에 승인 기록이 없는데 처리자·사유(${f.approvedBy ?? "-"}, ${f.approvalNote ?? "-"})가 적혀 있습니다 (DB를 직접 고쳤을 가능성).`,
+        });
+        continue;
+      }
     } else if (a.decision !== f.status || a.actor !== (f.approvedBy ?? "") || a.note !== (f.approvalNote ?? null)) {
       issues.push({
         findingId: f.id,

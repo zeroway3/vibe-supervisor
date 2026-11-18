@@ -1,3 +1,5 @@
+import type { ApprovalSignature } from "../signing/approval.js";
+
 export type OriginConfidence = "confirmed" | "estimated" | "unknown";
 
 export type LedgerEventType = "generated" | "detected" | "fixed" | "approved";
@@ -42,6 +44,10 @@ export type LedgerPayload =
       ruleId: string;
       file: string;
       line: number;
+      /** 승인자의 SSH 서명. actor(git 이메일)는 자기신고라, 서명이 있으면
+       * "이 키 소유자가 이 내용으로 승인했다"는 근거가 된다. 선택 필드라
+       * 서명 없는 승인·구버전 원장도 그대로 검증된다. */
+      signature?: ApprovalSignature;
     };
 
 export interface LedgerEntryInput {
