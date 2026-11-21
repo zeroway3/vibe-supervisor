@@ -18,6 +18,8 @@ import { resolveAllowedSigners, resolveSigningKey, signApproval, type ApprovalSi
 import { DECISION_LABEL, type FindingDecision } from "../report/types.js";
 import { loadConfig, saveConfig } from "../config/store.js";
 import type { CompletenessResult } from "../ledger/completeness.js";
+import type { LedgerEntry } from "../ledger/types.js";
+import { formatReviewResult, ReviewError, runReviewCommand } from "../review/cli.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const HOOK_SCRIPT = join(__dirname, "..", "hooks", "post-commit.js");
@@ -96,6 +98,18 @@ function printCompleteness(c: CompletenessResult) {
         `정상 작업일 수 있지만, 기록 이후 이력이 바뀌었다는 사실은 그대로 남습니다.`
     );
   }
+}
+
+
+function logDetail(e: LedgerEntry): string {
+  const p = e.payload;
+  if (p?.kind === "detected") return `탐지 ${p.findings.length}건`;
+  if (p?.kind === "approved") return `발견사항 #${p.findingId} ${DECISION_LABEL[p.decision]}`;
+  if (p?.kind === "reviewed") {
+    return `검토 ${p.decision}${p.note ? ` (${p.note})` : ""}`;
+  }
+  const ratio = p?.kind === "generated" && p.aiRatio !== null ? `, ratio=${p.aiRatio}` : "";
+  return `${e.originConfidence}${e.aiTool ? `(${e.aiTool}${ratio})` : ""}  파일 ${e.fileHashes.length}개`;
 }
 
 const program = new Command();
@@ -326,15 +340,8 @@ program
     ledger.close();
 
     for (const e of entries.slice().reverse()) {
-      const p = e.payload;
-      const detail =
-        p?.kind === "detected"
-          ? `탐지 ${p.findings.length}건`
-          : p?.kind === "approved"
-            ? `발견사항 #${p.findingId} ${DECISION_LABEL[p.decision]}`
-            : `${e.originConfidence}${e.aiTool ? `(${e.aiTool}${p?.kind === "generated" && p.aiRatio !== null ? `, ratio=${p.aiRatio}` : ""})` : ""}  파일 ${e.fileHashes.length}개`;
       console.log(
-        `#${e.id}  ${e.timestamp}  ${e.eventType.padEnd(9)} ${e.commitHash.slice(0, 8)}  ${e.actor}  ${detail}  hash=${e.hash.slice(0, 12)}…`
+        `#${e.id}  ${e.timestamp}  ${e.eventType.padEnd(9)} ${e.commitHash.slice(0, 8)}  ${e.actor}  ${logDetail(e)}  hash=${e.hash.slice(0, 12)}…`
       );
     }
   });
@@ -512,6 +519,32 @@ program
       `[vibe-supervisor] 발견사항 #${findingIdArg} — ${DECISION_LABEL[status]} 기록 완료 (${actor}` +
         `${signature ? `, SSH 서명 ${signature.fingerprint}` : ", 서명 없음"})`
     );
+  });
+
+
+program
+  .command("review <commit>")
+  .description("커밋의 AI 생성 코드에 대한 사람 검토(승인·반려·보류)를 원장에 기록한다")
+  .requiredOption("--decision <decision>", "approved | rejected | pending")
+  .option("--note <text>", "검토 사유")
+  .action((commit, opts) => {
+    const repoRoot = git(["rev-parse", "--show-toplevel"], process.cwd());
+    requireLedger(repoRoot);
+    try {
+      const entry = runReviewCommand({
+        repoRoot,
+        commit,
+        decision: opts.decision,
+        note: opts.note,
+      });
+      console.log(formatReviewResult(entry));
+    } catch (e) {
+      if (e instanceof ReviewError) {
+        console.error(e.message);
+        process.exit(1);
+      }
+      throw e;
+    }
   });
 
 program

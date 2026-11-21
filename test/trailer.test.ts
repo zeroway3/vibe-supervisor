@@ -18,6 +18,15 @@ test("AI 도구의 공동작성자 트레일러는 추정", () => {
   assert.equal(r.aiTool, "claude");
 });
 
+test("Grok 공동작성자 트레일러는 추정", () => {
+  const byName = parseAiTrailer("feat\n\nCo-Authored-By: Grok Bot <noreply@x.ai>\n");
+  assert.equal(byName.confidence, "estimated");
+  assert.equal(byName.aiTool, "grok");
+  const byDomain = parseAiTrailer("feat\n\nCo-Authored-By: Assistant <bot@x.ai>\n");
+  assert.equal(byDomain.confidence, "estimated");
+  assert.equal(byDomain.aiTool, "grok");
+});
+
 test("사람 공동작성자만 있으면 미상", () => {
   const r = parseAiTrailer("fix\n\nCo-authored-by: 김태희 <th@example.com>\n");
   assert.equal(r.confidence, "unknown");

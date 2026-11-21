@@ -2,7 +2,9 @@ import type { ApprovalSignature } from "../signing/approval.js";
 
 export type OriginConfidence = "confirmed" | "estimated" | "unknown";
 
-export type LedgerEventType = "generated" | "detected" | "fixed" | "approved";
+export type ReviewDecision = "approved" | "rejected" | "pending";
+
+export type LedgerEventType = "generated" | "detected" | "fixed" | "approved" | "reviewed";
 
 export interface FileHash {
   path: string;
@@ -48,6 +50,18 @@ export type LedgerPayload =
        * "이 키 소유자가 이 내용으로 승인했다"는 근거가 된다. 선택 필드라
        * 서명 없는 승인·구버전 원장도 그대로 검증된다. */
       signature?: ApprovalSignature;
+    }
+  | {
+      kind: "reviewed";
+      /** 검토 대상 커밋. LedgerEntry.commitHash와 같다. */
+      commitHash: string;
+      aiTool: string | null;
+      /** 대상 커밋의 generated 이벤트가 원장에 기록된 시각. */
+      generatedAt: string;
+      reviewer: string;
+      decision: ReviewDecision;
+      reviewedAt: string;
+      note: string | null;
     };
 
 export interface LedgerEntryInput {

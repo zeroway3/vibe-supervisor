@@ -3,3 +3,6 @@ dist/
 .vibe-supervisor/
 *.log
 sample-report.md
+
+coverage/
+.nyc_output/
