@@ -12,6 +12,7 @@
     "dev": "tsx src/cli/index.ts",
     "postcommit": "tsx src/hooks/post-commit.ts",
     "test": "node --import tsx --test test/*.test.ts",
+    "test:coverage": "c8 --reporter=text --reporter=text-summary --check-coverage --lines 80 --include 'src/review/**' npm test",
     "demo": "bash demo/run-demo.sh"
   },
   "dependencies": {
@@ -23,6 +24,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^20.14.0",
+    "c8": "^11.0.0",
     "fast-check": "^4.10.2",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"

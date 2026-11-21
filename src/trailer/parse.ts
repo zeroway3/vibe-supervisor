@@ -4,7 +4,7 @@
  * - confirmed: 개발자가 "AI-Generated: <tool>[, ratio=<0~1>]" 트레일러로 직접
  *   선언한 경우. 예: "AI-Generated: claude-code, ratio=0.7"
  * - estimated: 선언은 없지만 AI 코딩 도구가 스스로 붙이는 공동작성자
- *   트레일러(예: "Co-Authored-By: Claude ...", Copilot·Cursor·Aider 등)가 있는
+ *   트레일러(예: "Co-Authored-By: Claude ...", Copilot·Cursor·Aider·Grok 등)가 있는
  *   경우. 도구가 붙인 흔적이라 AI가 관여한 건 거의 확실하지만, 개발자가 얼마나
  *   고쳤는지(비율)는 알 수 없고 개발자가 지우거나 남길 수도 있어서 "추정"으로 둔다.
  * - unknown: 아무 신호도 없음. AI를 안 썼다는 뜻이 아니라 모른다는 뜻이다 —
@@ -32,6 +32,7 @@ const AI_CO_AUTHORS: Array<{ match: RegExp; tool: string }> = [
   { match: /codex|openai/i, tool: "codex" },
   { match: /gemini/i, tool: "gemini" },
   { match: /devin/i, tool: "devin" },
+  { match: /grok|xai|x\.ai/i, tool: "grok" },
 ];
 
 export function parseAiTrailer(commitMessage: string): TrailerResult {
