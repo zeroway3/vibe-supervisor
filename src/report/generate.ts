@@ -4,6 +4,7 @@ import type { AnchorCheck } from "../timestamp/check.js";
 import { rescanEvidence, type RescanEvidence } from "../ledger/rescan.js";
 import type { CompletenessResult } from "../ledger/completeness.js";
 import { DECISION_LABEL, type ReportInput, type Finding } from "./types.js";
+import type { ApprovalSignatureSummary } from "../signing/approval.js";
 
 /** 리포트에 필요한 검증 결과. CLI는 audit.ts의 AuditResult를 그대로 넘기고,
  * 샘플(demo.ts)은 가짜 값을 채워 넘긴다. */
@@ -14,6 +15,8 @@ export interface ReportAudit {
   anchorChecks: AnchorCheck[];
   /** git 이력 대비 기록 누락 검사 결과. 샘플 리포트처럼 git 이력이 없으면 생략한다. */
   completeness?: CompletenessResult;
+  /** 샘플 리포트(demo.ts)는 생략할 수 있다 — 생략하면 승인 서명 항목을 "기록 없음"으로 표기. */
+  approvalSignatures?: ApprovalSignatureSummary;
 }
 
 /** 기록 완전성 요약 — 표의 한 줄 라벨과 6장 상세. */
@@ -69,6 +72,42 @@ function completenessSummary(c: CompletenessResult | undefined): { label: string
     );
   }
   return { label, detail: parts.join("\n") };
+}
+
+function approvalSignatureSummary(s: ApprovalSignatureSummary | undefined): { label: string; detail: string } {
+  if (!s || s.total === 0) {
+    return { label: "— 승인 기록 없음", detail: "_승인·예외 처리 기록이 없습니다._" };
+  }
+  const failRows = s.failed.map(
+    (f) => `- ❌ 원장 #${f.entryId} (발견사항 #${f.findingId}, ${cell(f.actor)}): ${f.check!.message}`
+  );
+  const label =
+    s.failed.length > 0
+      ? `❌ ${s.failed.length}건 서명 검증 실패`
+      : s.good === 0
+        ? `⚠ ${s.total}건 모두 서명 없음 (git 이메일 자기신고)`
+        : `${s.unsigned === 0 ? "✅" : "⚠"} ${s.good}/${s.total}건 서명 유효` +
+          (s.allowedSignersUsed ? ` (본인 키 확인 ${s.trusted}건)` : " (키 소유자 미확인)");
+  const rows = s.checks
+    .map((c) => {
+      const st = !c.check
+        ? "서명 없음"
+        : { valid: "유효 (키 소유자 미확인)", trusted: "유효 · 본인 키", untrusted: "❌ 등록되지 않은 키", invalid: "❌ 내용 불일치" }[
+            c.check.status
+          ];
+      return `| #${c.entryId} | #${c.findingId} | ${cell(c.actor)} | ${st} | ${c.check ? `\`${c.check.fingerprint}\`` : "-"} |`;
+    })
+    .join("\n");
+  return {
+    label,
+    detail:
+      `| 원장 | 발견사항 | 처리자 | 서명 | 키 지문 |\n|---|---|---|---|---|\n${rows}` +
+      (failRows.length > 0 ? `\n\n${failRows.join("\n")}` : "") +
+      (s.allowedSignersUsed
+        ? ""
+        : `\n\n> 서명이 맞는지는 확인했지만, 그 키가 처리자 본인의 것인지는 확인하지 않았습니다. ` +
+          `\`report --allowed-signers <파일>\`로 생성하면 등록된 본인 키인지까지 표기됩니다.`),
+  };
 }
 
 type ReportFinding = Finding & { id?: number; commitHash?: string };
@@ -257,6 +296,7 @@ export function generateReport(input: ReportInput, audit: ReportAudit): string {
   });
   const anchors = anchorSummary(audit.anchorChecks);
   const completeness = completenessSummary(audit.completeness);
+  const approvalSigs = approvalSignatureSummary(audit.approvalSignatures);
   const cc = audit.crossCheck;
   const scans = audit.entries.filter((e) => e.eventType === "detected").length;
   const approvals = audit.entries.filter((e) => e.payload?.kind === "approved").length;
@@ -288,6 +328,7 @@ ${warningBlock}
 | 발견사항·승인 기록 대조 | ${ccLabel} |
 | 외부 타임스탬프 앵커 | ${anchors.label} |
 | 기록 완전성 (git 이력 대조) | ${completeness.label} |
+| 승인 행위 서명 (SSH) | ${approvalSigs.label} |
 
 ## 요약
 
@@ -381,9 +422,12 @@ ${sourcesUsed.map((s) => `| \`${s.version}\` | \`${s.hash.slice(0, 16)}…\` |`)
 2. **외부 타임스탬프 앵커**: 해시 체인은 원장 전체를 처음부터 다시 만드는 것은 막지
    못합니다. 그래서 독립 기관(RFC3161 TSA)이 원장 끝 해시에 서명한 토큰을 보관하고,
    검증 시 그 서명과 지금 원장의 해시를 대조합니다.
-3. **코드 본문 미저장**: 원장에는 파일 해시와 메타데이터만 있고 소스코드는 없습니다.
+3. **승인 행위 서명**: 처리자가 SSH 키로 승인 내용(대상·결정·사유·커밋)에 서명하면,
+   git 이메일(누구나 바꿀 수 있음)만이 아니라 "이 키 소유자가 이 내용으로 처리했다"는
+   근거가 생깁니다. 서명은 원장 레코드 안에 들어가 해시 체인으로도 보호됩니다.
+4. **코드 본문 미저장**: 원장에는 파일 해시와 메타데이터만 있고 소스코드는 없습니다.
    코드 외부 반출 금지 정책을 지키면서 원장을 그대로 제출할 수 있습니다.
-4. **기록 완전성**: 1·2는 "있는 기록을 고치지 않았다"만 보장합니다. 커밋 훅을 거치지
+5. **기록 완전성**: 1·2는 "있는 기록을 고치지 않았다"만 보장합니다. 커밋 훅을 거치지
    않은 커밋은 애초에 기록이 없으므로, git 이력과 원장을 대조해 빠진 커밋을 따로 찾습니다.
 
 ### 외부 타임스탬프 앵커 검증 결과
@@ -394,11 +438,15 @@ ${anchors.detail}
 
 ${completeness.detail}
 
+### 승인 행위 서명 검증 결과
+
+${approvalSigs.detail}
+
 ### 알려진 한계
 
-- 커밋 생성 시점의 서명 여부는 4장에 표기되지만(위 서명률 참고), **승인/예외
-  처리(approve) 행위 자체**는 여전히 git 설정의 이메일만 믿습니다. SSO 연동
-  전까지는 "누가 처리했는가"가 승인 단계에서는 자기신고에 가깝습니다.
+- 서명 없이 기록된 승인은 git 설정의 이메일만 근거로 합니다(자기신고). 서명된 승인도
+  "키 소유자가 본인인가"는 허용 서명자 목록을 누가 관리하느냐에 달려 있습니다 —
+  SSO 연동 전까지는 그 목록의 관리 책임이 조직에 있습니다.
 - 앵커와 앵커 사이 구간은 다음 앵커 전까지 외부 보증이 없습니다. 앵커 주기가 곧 보증 간격입니다.
 - 기록 완전성은 이 리포트를 생성한 저장소 사본의 git 이력 기준입니다. 원장은 저장소
   사본마다 따로 쌓이므로, 다른 개발자의 PC에서 만든 커밋은 그 사본의 원장에 기록됩니다
